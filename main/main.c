@@ -1,6 +1,6 @@
 /**
  * ESP32 Wake-on-LAN via Tailscale
- * Board : NodeMCU-32S / ESP32S  (no PSRAM)
+ * Tested board: ESP32-WROOM-32D dev kit (no PSRAM)
  * Port  : /dev/ttyUSB0
  *
  * The device joins your Tailscale network and listens on a
