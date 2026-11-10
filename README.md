@@ -37,9 +37,52 @@ an independently implemented Tailscale/WireGuard stack**.
 - [Hardware validation, limitations and security status](docs/VALIDATION_AND_LIMITATIONS.md)
 - [Upstream developers, third-party credits and licensing](docs/UPSTREAM_ATTRIBUTION.md)
 
-**Security status:** Functionally validated for this wake scenario, not
-production-security-ready. Authenticated TLS verification for DERP remains an
-open blocker, and the UDP wake command/ACL policy still needs a separate audit.
+**Security status:** Functionally validated for this wake scenario and
+substantially hardened relative to the reviewed upstream baseline. The
+implementation includes additional parser validation, key-persistence safeguards,
+DERP queue/reconnect improvements, reduced sensitive logging and WireGuard/lwIP
+lifecycle fixes. However, authenticated DERP TLS certificate verification
+remains an open blocker, and the UDP wake-command authorization model still
+requires a dedicated security audit.
+
+### Security improvements relative to upstream
+
+- Added validation for untrusted Noise frame lengths before parsing or
+  decryption.
+- Added HTTP/2 frame bounds checking to reduce out-of-bounds read risks.
+- Corrected Noise nonce advancement so receive nonces are updated only after
+  successful authentication.
+- Removed logging of WireGuard keys, Noise keys, nonces, challenge responses,
+  encrypted payloads and other sensitive protocol material.
+- Hardened persistent identity handling by failing closed on NVS storage errors
+  instead of silently generating replacement identities.
+- Added validation and bounds checks around peer, endpoint and protocol data
+  received from coordination servers.
+- Improved DERP framing and reconnect behavior after partial-frame failures.
+- Reworked DERP packet queuing with bounded memory usage, retry limits, aging
+  and duplicate suppression.
+- Moved WireGuard lifecycle operations to lwIP's TCP/IP thread to better align
+  with lwIP ownership requirements.
+- Added explicit WireGuard timer shutdown handling to reduce use-after-free risk
+  during interface teardown.
+
+### Areas still requiring review
+
+The implementation is not considered production-secure.
+
+Known security gaps include:
+
+1. **DERP TLS certificate verification remains disabled.**
+   Reviewed code paths still use `MBEDTLS_SSL_VERIFY_NONE`, meaning DERP server
+   identity is not cryptographically verified.
+
+2. **Wake-command authorization has not been independently audited.**
+   The WoL trigger mechanism should be protected with restrictive Tailscale ACLs
+   and should never be exposed through public Internet port-forwarding.
+
+3. **Long-term resilience remains unverified.**
+   Stress testing, endurance testing, reconnect cycling and memory-fragmentation
+   behavior have not been fully characterized.
 
 ## Hardware
 
