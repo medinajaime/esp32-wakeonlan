@@ -1096,6 +1096,42 @@ static void wireguardif_tmr(void *arg) {
 }
 
 
+/*
+ * Stop the periodic WireGuard timer before releasing its device/netif.
+ * Must be called synchronously from lwIP's tcpip thread, not directly from
+ * an arbitrary FreeRTOS task.  A timer callback cannot run concurrently
+ * with this cleanup when both execute in that single thread.
+ *
+ * This is an internal extension of the bundled wireguard-lwip fork.
+ */
+err_t wireguardif_shutdown(struct netif *netif) {
+    if (netif == NULL || netif->state == NULL) {
+        return ERR_ARG;
+    }
+
+    struct wireguard_device *device = (struct wireguard_device *)netif->state;
+    sys_untimeout(wireguardif_tmr, device);
+
+    /* No callbacks may use the owning ts_t after this point. */
+    device->derp_output_fn = NULL;
+    device->derp_output_ctx = NULL;
+    device->udp_output_fn = NULL;
+    device->udp_output_ctx = NULL;
+
+    if (device->udp_pcb != NULL) {
+        udp_recv(device->udp_pcb, NULL, NULL);
+        udp_remove(device->udp_pcb);
+        device->udp_pcb = NULL;
+    }
+
+    netif_set_link_down(netif);
+    netif_set_down(netif);
+    netif_remove(netif);
+    netif->state = NULL;
+    mem_free(device);
+    return ERR_OK;
+}
+
 err_t wireguardif_init(struct netif *netif) {
 	err_t result;
 	struct wireguardif_init_data *init_data;

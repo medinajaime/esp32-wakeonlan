@@ -1,17 +1,100 @@
-# ESP-IDF generated files
+# ESP32-WoL — ESP-IDF, Tailscale and local development
+# Defense in depth only: review the staged diff before every public push.
+
+# ESP-IDF build outputs and generated dependencies
 build/
+build_*/
+build-*/
+managed_components/
+
+# Device-specific ESP-IDF configuration (may contain Wi-Fi / auth credentials)
 sdkconfig
-sdkconfig.old
+sdkconfig.*
+!sdkconfig.example
+!sdkconfig.defaults.example
 
-# Logs / serial captures
+# Environment files and credentials
+.env
+.env.*
+*.env
+*.env.*
+!.env.example
+!.env.template
+!*.env.example
+!*.env.template
+secrets.json
+secrets.*.json
+credentials.json
+credentials.*.json
+*authkey*.json
+*token*.json
+*.secret
+*.secrets
+
+# Private key / identity files (public certificate exceptions require review)
+*.key
+*.pem
+*.p8
+*.p12
+*.pfx
+*.jks
+*.keystore
+id_rsa
+id_ed25519
+id_ecdsa
+id_dsa
+
+# Compiled firmware, flash images, debug and raw memory dumps
+*.bin
+*.elf
+*.map
+*.hex
+*.uf2
+*.dump
+*.core
 *.log
-qrt.txt
+*.gcda
+*.gcno
+*.o
+*.obj
 
-# Python
+# Private flash and NVS backup directories
+backup/
+backups/
+flash-backup/
+flash-backups/
+flash_backup/
+flash_backups/
+nvs-backup/
+nvs-backups/
+nvs_backup/
+nvs_backups/
+reviewed-input/
+
+# One-off review patches, packages and local application/rollback scripts
+/*.patch
+/*.diff
+/*.zip
+/apply_reviewed_files.ps1
+/apply_*candidate*.ps1
+/rollback_*candidate*.ps1
+/ESP32_*candidate*/
+
+# Editors and operating systems
+.vscode/
+.idea/
+.history/
 __pycache__/
+.pytest_cache/
 *.pyc
-
-# ESP-IDF dependency lock
-dependencies.lock
-*HISTORY.md
-*PAPER.md
+*.swp
+*.swo
+*.tmp
+*.temp
+*.bak
+*.backup
+*.orig
+*~
+.DS_Store
+Thumbs.db
+Desktop.ini

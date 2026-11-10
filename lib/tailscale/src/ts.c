@@ -244,7 +244,10 @@ esp_err_t ts_connect(ts_t *ml) {
     if (ml->config.enable_disco) {
         ret = ts_disco_init(ml);
         if (ret != ESP_OK) {
-            ESP_LOGW(TAG, "DISCO init failed, continuing without: %d", ret);
+            ESP_LOGW(TAG, "DISCO init failed; direct path discovery disabled: %d", ret);
+            // WireGuard owns UDP/51820 in the current configuration.
+            // Do not attempt periodic DISCO probes with an invalid socket.
+            ml->config.enable_disco = false;
         }
     }
 

@@ -16,6 +16,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
+#include <stdint.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <sys/select.h>
@@ -28,16 +29,22 @@
 // lwIP headers
 #include "lwip/netif.h"
 #include "lwip/ip_addr.h"
+#include "lwip/ip.h"
 #include "lwip/err.h"
 #include "lwip/mem.h"      // For mem_free()
 #include "lwip/udp.h"      // For udp_remove()
 #include "lwip/pbuf.h"     // For pbuf_alloc()
-#include "lwip/timeouts.h" // For sys_untimeout()
+#include "lwip/tcpip.h"   // For tcpip_callback()
 
 // External lwIP global
 extern struct netif *netif_list;
 
 static const char *TAG = "ts_wg";
+
+/* Internal lifecycle API provided by the bundled wireguard_lwip fork.
+ * Called exclusively in the lwIP TCP/IP thread via tcpip_callback(). */
+extern err_t wireguardif_shutdown(struct netif *netif);
+
 
 /* Forward declaration for DERP output callback */
 static err_t wg_derp_output_callback(const uint8_t *peer_public_key, const uint8_t *data, size_t len, void *ctx);
@@ -50,18 +57,30 @@ static err_t wg_derp_output_callback(const uint8_t *peer_public_key, const uint8
  * We queue these packets and send them from the main Tailscale task.
  * ========================================================================== */
 
-#define DERP_QUEUE_SIZE 32  // Increased from 8 to handle multiple peer handshakes
-#define DERP_PACKET_MAX_SIZE 256
+#define DERP_QUEUE_SIZE 32
+// A full WireGuard transport packet may be larger than a handshake (148 bytes).
+// Cap total queued packet memory to protect the ESP32 without PSRAM.
+#define DERP_QUEUE_MEMORY_LIMIT (8U * 1024U)
+#define DERP_QUEUE_MAX_ATTEMPTS 6U
+#define DERP_QUEUE_MAX_AGE_MS 30000U
+#define DERP_QUEUE_RETRY_MS 300U
 
 typedef struct {
     uint8_t peer_pubkey[32];
-    uint8_t data[DERP_PACKET_MAX_SIZE];
+    uint8_t *data;  // Heap-owned until successfully sent or dropped.
     size_t len;
     bool pending;
+    bool in_flight;
+    uint8_t attempts;
+    uint64_t queued_ms;
+    uint64_t retry_after_ms;
 } derp_queued_packet_t;
 
 static derp_queued_packet_t derp_packet_queue[DERP_QUEUE_SIZE];
 static ts_t *queued_ml_ctx = NULL;
+static size_t queued_derp_bytes = 0;
+static bool derp_queue_processing = false;
+static portMUX_TYPE derp_queue_lock = portMUX_INITIALIZER_UNLOCKED;
 
 /* NVS keys for persistent storage */
 #define NVS_NAMESPACE       "tailscale"
@@ -103,10 +122,8 @@ static esp_err_t load_or_generate_keys(ts_t *ml) {
 
     ret = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
     if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to open NVS, generating ephemeral keys: %d", ret);
-        generate_wireguard_keys(ml->wireguard.private_key, ml->wireguard.public_key);
-        generate_wireguard_keys(ml->wireguard.disco_private_key, ml->wireguard.disco_public_key);
-        return ESP_OK;  // Still works, just not persistent
+        ESP_LOGE(TAG, "Failed to open NVS for WireGuard identity: %s", esp_err_to_name(ret));
+        return ret;  // Fail closed rather than silently changing device identity.
     }
 
     // Try to load WireGuard keys
@@ -116,16 +133,26 @@ static esp_err_t load_or_generate_keys(ts_t *ml) {
         key_len = 32;
         ret = nvs_get_blob(nvs, NVS_KEY_WG_PUBLIC, ml->wireguard.public_key, &key_len);
         if (ret == ESP_OK && key_len == 32) {
+            uint8_t derived_public[32];
+            x25519_base(derived_public, ml->wireguard.private_key, 1);
+            if (memcmp(derived_public, ml->wireguard.public_key, 32) != 0) {
+                memcpy(ml->wireguard.public_key, derived_public, 32);
+                need_save = true;
+            }
             ESP_LOGI(TAG, "Loaded existing WireGuard keys from NVS");
         } else {
             // Regenerate public key from private
             x25519_base(ml->wireguard.public_key, ml->wireguard.private_key, 1);
             need_save = true;
         }
-    } else {
+    } else if (ret == ESP_ERR_NVS_NOT_FOUND) {
         ESP_LOGI(TAG, "No WireGuard keys in NVS, generating new ones");
         generate_wireguard_keys(ml->wireguard.private_key, ml->wireguard.public_key);
         need_save = true;
+    } else {
+        ESP_LOGE(TAG, "Failed to read WireGuard private key from NVS: %s", esp_err_to_name(ret));
+        nvs_close(nvs);
+        return ret == ESP_OK ? ESP_ERR_INVALID_SIZE : ret;
     }
 
     // Try to load Disco keys
@@ -135,15 +162,25 @@ static esp_err_t load_or_generate_keys(ts_t *ml) {
         key_len = 32;
         ret = nvs_get_blob(nvs, NVS_KEY_DISCO_PUB, ml->wireguard.disco_public_key, &key_len);
         if (ret == ESP_OK && key_len == 32) {
+            uint8_t derived_public[32];
+            x25519_base(derived_public, ml->wireguard.disco_private_key, 1);
+            if (memcmp(derived_public, ml->wireguard.disco_public_key, 32) != 0) {
+                memcpy(ml->wireguard.disco_public_key, derived_public, 32);
+                need_save = true;
+            }
             ESP_LOGI(TAG, "Loaded existing Disco keys from NVS");
         } else {
             x25519_base(ml->wireguard.disco_public_key, ml->wireguard.disco_private_key, 1);
             need_save = true;
         }
-    } else {
+    } else if (ret == ESP_ERR_NVS_NOT_FOUND) {
         ESP_LOGI(TAG, "No Disco keys in NVS, generating new ones");
         generate_wireguard_keys(ml->wireguard.disco_private_key, ml->wireguard.disco_public_key);
         need_save = true;
+    } else {
+        ESP_LOGE(TAG, "Failed to read Disco private key from NVS: %s", esp_err_to_name(ret));
+        nvs_close(nvs);
+        return ret == ESP_OK ? ESP_ERR_INVALID_SIZE : ret;
     }
 
     // Save newly generated keys
@@ -170,7 +207,10 @@ static esp_err_t load_or_generate_keys(ts_t *ml) {
     }
 
     nvs_close(nvs);
-    return ESP_OK;
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "WireGuard key persistence failed: %s", esp_err_to_name(ret));
+    }
+    return ret;
 }
 
 /**
@@ -219,6 +259,50 @@ static uint32_t lwip_ip_to_tailscale(const ip_addr_t *lwip_ip) {
            ((ip >> 24) & 0xFF);
 }
 
+/*
+ * Synchronous cross-thread operations.  The stack context stays valid because
+ * callers wait for the semaphore before returning.  Never call these wrappers
+ * from lwIP's TCP/IP thread (that would deadlock).
+ */
+typedef struct {
+    struct netif *netif;
+    ts_t *ml;
+    SemaphoreHandle_t done;
+    struct wireguardif_init_data init_data;
+    err_t result;
+} ts_wg_lwip_op_t;
+
+static void ts_wg_lwip_init_callback(void *argument) {
+    ts_wg_lwip_op_t *op = (ts_wg_lwip_op_t *)argument;
+    struct netif *netif = op->netif;
+    netif->state = &op->init_data;
+    netif->input = ip_input;
+    op->result = wireguardif_init(netif);
+    if (op->result == ERR_OK) {
+        /* Existing project manually registers its interface. Preserve that
+         * behavior, but do the operation under TCP/IP thread ownership. */
+        IP4_ADDR(&netif->ip_addr.u_addr.ip4, 100, 64, 0, 1);
+        netif->ip_addr.type = IPADDR_TYPE_V4;
+        IP4_ADDR(&netif->netmask.u_addr.ip4, 255, 192, 0, 0);
+        netif->netmask.type = IPADDR_TYPE_V4;
+        IP4_ADDR(&netif->gw.u_addr.ip4, 0, 0, 0, 0);
+        netif->gw.type = IPADDR_TYPE_V4;
+
+        netif->next = netif_list;
+        netif_list = netif;
+        netif_set_up(netif);
+        netif_set_link_up(netif);
+        wireguardif_set_derp_output(netif, wg_derp_output_callback, op->ml);
+    }
+    xSemaphoreGive(op->done);
+}
+
+static void ts_wg_lwip_shutdown_callback(void *argument) {
+    ts_wg_lwip_op_t *op = (ts_wg_lwip_op_t *)argument;
+    op->result = wireguardif_shutdown(op->netif);
+    xSemaphoreGive(op->done);
+}
+
 /* ============================================================================
  * Initialization
  * ========================================================================== */
@@ -227,6 +311,28 @@ esp_err_t ts_wireguard_init(ts_t *ml) {
     ESP_LOGI(TAG, "Initializing WireGuard with wireguard-lwip");
 
     memset(&ml->wireguard, 0, sizeof(ts_wireguard_t));
+
+    // Do not retain queue entries from a previous WireGuard session.
+    // Initialization is called only after the previous connection task stops.
+    uint8_t *stale_queue_data[DERP_QUEUE_SIZE] = {0};
+    portENTER_CRITICAL(&derp_queue_lock);
+    bool queue_busy = derp_queue_processing;
+    if (!queue_busy) {
+        for (int i = 0; i < DERP_QUEUE_SIZE; i++) {
+            stale_queue_data[i] = derp_packet_queue[i].data;
+            memset(&derp_packet_queue[i], 0, sizeof(derp_packet_queue[i]));
+        }
+        queued_derp_bytes = 0;
+        queued_ml_ctx = NULL;
+    }
+    portEXIT_CRITICAL(&derp_queue_lock);
+    if (queue_busy) {
+        ESP_LOGE(TAG, "Cannot initialize WireGuard while DERP queue is draining");
+        return ESP_ERR_INVALID_STATE;
+    }
+    for (int i = 0; i < DERP_QUEUE_SIZE; i++) {
+        free(stale_queue_data[i]);
+    }
 
     // Load or generate WireGuard and Disco keys (persisted in NVS)
     esp_err_t key_ret = load_or_generate_keys(ml);
@@ -244,7 +350,6 @@ esp_err_t ts_wireguard_init(ts_t *ml) {
     }
 
     ESP_LOGI(TAG, "WireGuard and Disco keys ready");
-    ESP_LOGD(TAG, "Private key (first 8 chars): %.8s...", ml->wireguard.private_key_b64);
 
     // Allocate lwIP netif structure
     // IMPORTANT: Use calloc() to zero-initialize all fields, including:
@@ -257,127 +362,85 @@ esp_err_t ts_wireguard_init(ts_t *ml) {
         return ESP_ERR_NO_MEM;
     }
 
-    // Prepare WireGuard initialization data (use persistent base64 key!)
-    struct wireguardif_init_data wg_init = {0};
-    wg_init.private_key = ml->wireguard.private_key_b64;
-    wg_init.listen_port = 51820;  // Standard WireGuard port
-    wg_init.bind_netif = NULL;    // Use default routing
+    /* The raw lwIP APIs and sys_timeout() in wireguardif_init() must be run
+     * by lwIP's TCP/IP thread.  This callback completes before we return. */
+    SemaphoreHandle_t done = xSemaphoreCreateBinary();
+    if (done == NULL) {
+        free(ml->wireguard.netif);
+        ml->wireguard.netif = NULL;
+        return ESP_ERR_NO_MEM;
+    }
 
-    // WORKAROUND for ESP-IDF netif callback crash:
-    // Call wireguardif_init() FIRST to initialize netif->state with wireguard_device,
-    // THEN call netif_add() with NULL init function to just register the netif.
-    // This prevents ESP-IDF's callback from seeing wireguardif_init_data in netif->state
-    // and interpreting it as an esp_netif structure.
-
-    ESP_LOGI(TAG, "Pre-initializing WireGuard netif...");
-    ESP_LOGD(TAG, "WireGuard private key (base64): %s", ml->wireguard.private_key_b64);
-    ESP_LOGD(TAG, "WireGuard listen port: %d", wg_init.listen_port);
-
-    ((struct netif *)ml->wireguard.netif)->state = &wg_init;
-    err_t init_result = wireguardif_init((struct netif *)ml->wireguard.netif);
-
-    if (init_result != ERR_OK) {
-        ESP_LOGE(TAG, "wireguardif_init() failed with error %d", init_result);
+    ts_wg_lwip_op_t op = {
+        .netif = (struct netif *)ml->wireguard.netif,
+        .ml = ml,
+        .done = done,
+        .result = ERR_IF,
+        .init_data = {
+            .private_key = ml->wireguard.private_key_b64,
+            .listen_port = 51820,
+            .bind_netif = NULL,
+        },
+    };
+    err_t call_err = tcpip_callback(ts_wg_lwip_init_callback, &op);
+    if (call_err != ERR_OK) {
+        ESP_LOGE(TAG, "Failed to schedule WireGuard initialization in TCP/IP thread: %d", call_err);
+        vSemaphoreDelete(done);
         free(ml->wireguard.netif);
         ml->wireguard.netif = NULL;
         return ESP_FAIL;
     }
 
-    ESP_LOGI(TAG, "WireGuard netif initialized successfully!");
-    ESP_LOGI(TAG, "Manually registering netif with lwIP...");
-
-    // Since wireguardif_init() succeeded, we now need to manually add the netif to lwIP's global list
-    // and set its IP address. We can't use netif_add() because the netif is already initialized.
-
-    // IMPORTANT: Set IP addresses directly on netif structure fields to avoid triggering ESP-IDF callbacks
-    // Do NOT use netif_set_addr() - it triggers esp_netif_internal_dhcpc_cb() which crashes
-    struct netif *netif = (struct netif *)ml->wireguard.netif;
-
-    // Set IP address directly
-    IP4_ADDR(&netif->ip_addr.u_addr.ip4, 100, 64, 0, 1);  // Temporary IP
-    netif->ip_addr.type = IPADDR_TYPE_V4;
-
-    // Set netmask directly
-    IP4_ADDR(&netif->netmask.u_addr.ip4, 255, 192, 0, 0);  // /10 subnet
-    netif->netmask.type = IPADDR_TYPE_V4;
-
-    // Set gateway directly
-    IP4_ADDR(&netif->gw.u_addr.ip4, 0, 0, 0, 0);  // No gateway for VPN
-    netif->gw.type = IPADDR_TYPE_V4;
-
-    ESP_LOGI(TAG, "IP addresses set: 100.64.0.1/10");
-
-    // Manually add to global netif list
-    struct netif *netif_list_head = netif_list;
-    netif->next = netif_list_head;
-    netif_list = netif;
-
-    ESP_LOGI(TAG, "WireGuard netif added to global list");
-
-    // Bring interface up
-    netif_set_up((struct netif *)ml->wireguard.netif);
-    netif_set_link_up((struct netif *)ml->wireguard.netif);
+    /* Do not timeout and release 'op' while its callback may still execute. */
+    (void)xSemaphoreTake(done, portMAX_DELAY);
+    vSemaphoreDelete(done);
+    if (op.result != ERR_OK) {
+        ESP_LOGE(TAG, "WireGuard lwIP initialization failed: %d", op.result);
+        free(ml->wireguard.netif);
+        ml->wireguard.netif = NULL;
+        return ESP_FAIL;
+    }
 
     ml->wireguard.listen_port = 51820;
     ml->wireguard.initialized = true;
-
-    // Register DERP output callback for DERP-only peers
-    // This allows WireGuard to send packets via DERP when peer has no direct endpoint
-    ESP_LOGI(TAG, "Registering DERP output callback for WireGuard");
-    wireguardif_set_derp_output((struct netif *)ml->wireguard.netif, wg_derp_output_callback, ml);
-
     ESP_LOGI(TAG, "WireGuard interface initialized on port %d", ml->wireguard.listen_port);
 
     return ESP_OK;
 }
 
 esp_err_t ts_wireguard_deinit(ts_t *ml) {
-    ESP_LOGI(TAG, "Deinitializing WireGuard");
+    if (ml == NULL) return ESP_ERR_INVALID_ARG;
+    if (!ml->wireguard.initialized) return ESP_OK;
+    if (ml->wireguard.netif == NULL) return ESP_ERR_INVALID_STATE;
 
-    if (!ml->wireguard.initialized) {
-        return ESP_OK;  // Already deinitialized
+    ESP_LOGI(TAG, "Deinitializing WireGuard in lwIP TCP/IP thread");
+    SemaphoreHandle_t done = xSemaphoreCreateBinary();
+    if (done == NULL) return ESP_ERR_NO_MEM;
+
+    ts_wg_lwip_op_t op = {
+        .netif = (struct netif *)ml->wireguard.netif,
+        .done = done,
+        .result = ERR_IF,
+    };
+    err_t call_err = tcpip_callback(ts_wg_lwip_shutdown_callback, &op);
+    if (call_err != ERR_OK) {
+        ESP_LOGE(TAG, "Failed to schedule WireGuard shutdown in TCP/IP thread: %d", call_err);
+        vSemaphoreDelete(done);
+        return ESP_FAIL;  // Keep device/netif allocated: callback timer may still refer to it.
     }
 
-    if (ml->wireguard.netif) {
-        struct netif *netif = (struct netif *)ml->wireguard.netif;
-
-        // Bring interface down first
-        netif_set_link_down(netif);
-        netif_set_down(netif);
-
-        // WORKAROUND: Brief delay to allow any pending wireguardif_tmr() callback
-        // to complete before we free the device structure. The timer runs every 400ms,
-        // so 500ms ensures any in-flight callback finishes.
-        vTaskDelay(pdMS_TO_TICKS(500));
-
-        // Clean up wireguard_device resources
-        if (netif->state) {
-            struct wireguard_device *device = (struct wireguard_device *)netif->state;
-
-            // Remove UDP PCB to free port 51820 for next init
-            if (device->udp_pcb) {
-                udp_remove(device->udp_pcb);
-                device->udp_pcb = NULL;
-            }
-
-            // Free wireguard_device allocated by wireguardif_init()
-            mem_free(netif->state);
-            netif->state = NULL;
-        }
-
-        // Remove from global netif list
-        netif_remove(netif);
-
-        // Free netif structure itself (we allocated this with calloc())
-        free(netif);
-        ml->wireguard.netif = NULL;
+    /* Wait until the timer is cancelled and netif/device are removed. */
+    (void)xSemaphoreTake(done, portMAX_DELAY);
+    vSemaphoreDelete(done);
+    if (op.result != ERR_OK) {
+        ESP_LOGE(TAG, "WireGuard shutdown failed: %d", op.result);
+        return ESP_FAIL;  // Never free the netif while its timer may remain active.
     }
 
+    free(ml->wireguard.netif); // Our calloc(); device was freed inside TCP/IP callback.
+    ml->wireguard.netif = NULL;
     ml->wireguard.initialized = false;
-
-    // Clear keys from memory
     memset(&ml->wireguard, 0, sizeof(ts_wireguard_t));
-
     return ESP_OK;
 }
 
@@ -709,7 +772,8 @@ esp_err_t ts_wireguard_inject_derp_packet(ts_t *ml, uint32_t src_ip,
         return ESP_ERR_INVALID_STATE;
     }
 
-    if (len < 4) {
+    // lwIP pbuf_alloc accepts a 16-bit length. Never truncate size_t.
+    if (!data || len < 4 || len > UINT16_MAX) {
         return ESP_ERR_INVALID_SIZE;
     }
 
@@ -727,7 +791,11 @@ esp_err_t ts_wireguard_inject_derp_packet(ts_t *ml, uint32_t src_ip,
         return ESP_ERR_NO_MEM;
     }
 
-    memcpy(p->payload, data, len);
+    // pbuf_take also works correctly if lwIP returns a chained pbuf.
+    if (pbuf_take(p, data, (u16_t)len) != ERR_OK) {
+        pbuf_free(p);
+        return ESP_FAIL;
+    }
 
     // Always inject DERP packets with src_addr = 0.0.0.0.
     //
@@ -786,118 +854,126 @@ esp_err_t ts_wireguard_inject_packet(ts_t *ml, uint32_t src_ip, uint16_t src_por
  * This is called from wireguardif_peer_output() when peer->ip is 0.0.0.0.
  * We relay the WireGuard packet through DERP using the peer's public key.
  */
-static err_t wg_derp_output_callback(const uint8_t *peer_public_key, const uint8_t *data, size_t len, void *ctx) {
+static err_t wg_derp_output_callback(const uint8_t *peer_public_key,
+                                     const uint8_t *data, size_t len, void *ctx) {
     ts_t *ml = (ts_t *)ctx;
-
-    if (!ml) {
-        ESP_LOGE(TAG, "DERP output callback: NULL context");
+    if (!ml || !peer_public_key || !data || len == 0 || len > TS_NETWORK_BUFFER_SIZE) {
         return ERR_ARG;
     }
 
-    // Check available stack - mbedtls TLS operations need at least 4KB
-    // The WireGuard timer callback runs with very limited stack (~1KB remaining)
-    // which is not enough for mbedtls_ssl_write operations
-    UBaseType_t stack_remaining = uxTaskGetStackHighWaterMark(NULL);
-    if (stack_remaining < 4096) {
-        // Queue the packet for later sending from main task
-        if (len > DERP_PACKET_MAX_SIZE) {
-            ESP_LOGW(TAG, "DERP packet too large to queue: %u", (unsigned int)len);
-            return ERR_MEM;
+    // WireGuard invokes this callback from different task contexts, including
+    // lwIP timers. Never do TLS I/O here; enqueue and return promptly.
+    uint8_t *copy = malloc(len);
+    if (!copy) return ERR_MEM;
+    memcpy(copy, data, len);
+
+    uint64_t now = ts_get_time_ms();
+    int free_slot = -1;
+    bool duplicate = false;
+    bool accepted = false;
+    portENTER_CRITICAL(&derp_queue_lock);
+    if (queued_ml_ctx && queued_ml_ctx != ml) {
+        // Avoid mixing packets from unrelated sessions.
+        portEXIT_CRITICAL(&derp_queue_lock);
+        free(copy);
+        return ERR_IF;
+    }
+    for (int i = 0; i < DERP_QUEUE_SIZE; i++) {
+        derp_queued_packet_t *slot = &derp_packet_queue[i];
+        if (slot->pending && slot->len == len &&
+            memcmp(slot->peer_pubkey, peer_public_key, 32) == 0 &&
+            memcmp(slot->data, data, len) == 0) {
+            duplicate = true;
+            break;
         }
-
-        // RATE LIMITING: Prevent handshake spam that congests DERP socket
-        // WireGuard retries handshakes every 5 seconds, but we might get called
-        // multiple times per retry. Limit to 1 packet per peer per 500ms.
-        static uint64_t last_queue_time[DERP_QUEUE_SIZE] = {0};
-        static uint8_t last_peer_key[DERP_QUEUE_SIZE][4] = {{0}};  // First 4 bytes of peer key
-
-        uint64_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
-
-        // Check if we recently queued a packet for this peer
-        for (int i = 0; i < DERP_QUEUE_SIZE; i++) {
-            if (memcmp(last_peer_key[i], peer_public_key, 4) == 0) {
-                if (now_ms - last_queue_time[i] < 500) {
-                    // Silently drop - we just sent one
-                    ESP_LOGD(TAG, "DERP queue rate-limited for peer %02x%02x...",
-                             peer_public_key[0], peer_public_key[1]);
-                    return ERR_OK;
-                }
-            }
-        }
-
-        // Find a free slot in the queue
-        for (int i = 0; i < DERP_QUEUE_SIZE; i++) {
-            if (!derp_packet_queue[i].pending) {
-                memcpy(derp_packet_queue[i].peer_pubkey, peer_public_key, 32);
-                memcpy(derp_packet_queue[i].data, data, len);
-                derp_packet_queue[i].len = len;
-                derp_packet_queue[i].pending = true;
-                queued_ml_ctx = ml;
-
-                // Record for rate limiting
-                memcpy(last_peer_key[i], peer_public_key, 4);
-                last_queue_time[i] = now_ms;
-
-                ESP_LOGD(TAG, "DERP output queued (slot %d): %u bytes",
-                         i, (unsigned int)len);
-                return ERR_OK;
-            }
-        }
-
-        ESP_LOGW(TAG, "DERP queue full, dropping packet");
-        return ERR_OK;  // Don't return error, WireGuard will retry
+        if (!slot->pending && free_slot < 0) free_slot = i;
     }
 
-    ESP_LOGI(TAG, "DERP output callback: sending %u byte WG packet to peer %02x%02x%02x%02x... (stack=%lu)",
-             (unsigned int)len, peer_public_key[0], peer_public_key[1], peer_public_key[2], peer_public_key[3],
-             (unsigned long)stack_remaining);
-
-    // Send via DERP using the peer's public key
-    esp_err_t err = ts_derp_send_raw(ml, peer_public_key, data, len);
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "DERP send failed: %d", err);
-        return ERR_IF;  // Interface error
+    if (!duplicate && free_slot >= 0 &&
+        len <= DERP_QUEUE_MEMORY_LIMIT - queued_derp_bytes) {
+        derp_queued_packet_t *slot = &derp_packet_queue[free_slot];
+        memcpy(slot->peer_pubkey, peer_public_key, 32);
+        slot->data = copy;
+        slot->len = len;
+        slot->pending = true;
+        slot->in_flight = false;
+        slot->attempts = 0;
+        slot->queued_ms = now;
+        slot->retry_after_ms = now;
+        queued_derp_bytes += len;
+        queued_ml_ctx = ml;
+        copy = NULL; // Ownership transferred to queue.
+        accepted = true;
     }
+    portEXIT_CRITICAL(&derp_queue_lock);
 
+    free(copy);
+    if (duplicate) return ERR_OK;
+    if (!accepted) {
+        ESP_LOGW(TAG, "DERP queue full or memory budget reached (packet=%u bytes)",
+                 (unsigned)len);
+        return ERR_MEM;
+    }
     return ERR_OK;
 }
 
 /**
- * @brief Process queued DERP packets from main task context
- *
- * Call this periodically from the main Tailscale task which has sufficient stack.
+ * Drain at most one packet per call. TLS can block; retries are bounded.
+ * A single processor may send, while lwIP timer callbacks continue enqueuing.
  */
 void ts_wireguard_process_derp_queue(void) {
-    if (!queued_ml_ctx) {
-        return;
-    }
+    int chosen = -1;
+    ts_t *ml = NULL;
+    uint64_t now = ts_get_time_ms();
 
-    // Check if any packets pending
-    int pending_count = 0;
-    for (int i = 0; i < DERP_QUEUE_SIZE; i++) {
-        if (derp_packet_queue[i].pending) pending_count++;
-    }
-    if (pending_count > 0) {
-        ESP_LOGI(TAG, "Processing DERP queue: %d packets pending", pending_count);
-    }
-
-    for (int i = 0; i < DERP_QUEUE_SIZE; i++) {
-        if (derp_packet_queue[i].pending) {
-            ESP_LOGI(TAG, "Sending queued DERP packet (slot %d): %u bytes",
-                     i, (unsigned int)derp_packet_queue[i].len);
-
-            esp_err_t err = ts_derp_send_raw(
-                queued_ml_ctx,
-                derp_packet_queue[i].peer_pubkey,
-                derp_packet_queue[i].data,
-                derp_packet_queue[i].len
-            );
-
-            if (err != ESP_OK) {
-                ESP_LOGW(TAG, "Queued DERP send failed: %d", err);
+    portENTER_CRITICAL(&derp_queue_lock);
+    if (!derp_queue_processing && queued_ml_ctx) {
+        for (int i = 0; i < DERP_QUEUE_SIZE; i++) {
+            derp_queued_packet_t *slot = &derp_packet_queue[i];
+            if (slot->pending && !slot->in_flight && now >= slot->retry_after_ms) {
+                chosen = i;
+                slot->in_flight = true;
+                derp_queue_processing = true;
+                ml = queued_ml_ctx;
+                break;
             }
+        }
+    }
+    portEXIT_CRITICAL(&derp_queue_lock);
+    if (chosen < 0) return;
 
-            derp_packet_queue[i].pending = false;
+    // Queue entry remains allocated and reserved during this network call.
+    derp_queued_packet_t *slot = &derp_packet_queue[chosen];
+    esp_err_t err = ts_derp_send_raw(ml, slot->peer_pubkey, slot->data, slot->len);
+    uint8_t *release_data = NULL;
+    bool dropped = false;
+    uint8_t attempts = 0;
+    now = ts_get_time_ms();
+
+    portENTER_CRITICAL(&derp_queue_lock);
+    slot->in_flight = false;
+    if (err == ESP_OK || ++slot->attempts >= DERP_QUEUE_MAX_ATTEMPTS ||
+        now - slot->queued_ms >= DERP_QUEUE_MAX_AGE_MS) {
+        dropped = (err != ESP_OK);
+        release_data = slot->data;
+        queued_derp_bytes -= slot->len;
+        memset(slot, 0, sizeof(*slot));
+    } else {
+        // Backoff reduces contention with TLS reads and avoids a retry storm.
+        slot->retry_after_ms = now + DERP_QUEUE_RETRY_MS * (1U << (slot->attempts - 1U));
+        attempts = slot->attempts;
+    }
+    derp_queue_processing = false;
+    portEXIT_CRITICAL(&derp_queue_lock);
+
+    free(release_data);
+    if (err != ESP_OK) {
+        if (dropped) {
+            ESP_LOGW(TAG, "DERP packet dropped after retry/age limit (error=%s)",
+                     esp_err_to_name(err));
+        } else {
+            ESP_LOGD(TAG, "DERP queued send deferred (error=%s, attempts=%u)",
+                     esp_err_to_name(err), attempts);
         }
     }
 }
