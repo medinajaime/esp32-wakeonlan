@@ -10,6 +10,17 @@ Wake up a PC on your home network from anywhere through Tailscale, using the
 The ESP32 joins your tailnet, listens for a UDP trigger, and broadcasts a WoL
 magic packet on your local network.
 
+## Related Proxmox Homelab
+
+This ESP32 firmware is one component of the broader [Proxmox Cloud Homelab](https://github.com/vmanX8/proxmox-cloud-homelab).
+
+- [Lab 06 — ESP32 Remote Wake-on-LAN Gateway](https://github.com/vmanX8/proxmox-cloud-homelab/blob/main/docs/06-esp32-remote-wol-gateway.md) documents how the gateway fits into the Proxmox host and Tailscale/WoL architecture.
+- [Architecture overview](https://github.com/vmanX8/proxmox-cloud-homelab/blob/main/docs/ARCHITECTURE.md) separates powered-on remote management from remote wake-up.
+
+**Validation boundary:** The two successful end-to-end tests demonstrate functional wake-up on the tested hardware and observed DERP relay path. They do **not** resolve the disabled DERP TLS server verification, wake-command authorization audit or long-term reliability testing. See [validation and limitations](docs/VALIDATION_AND_LIMITATIONS.md).
+
+The firmware, dependencies, setup scripts, third-party notices and implementation history remain in this repository; the Proxmox repository only links here and does not duplicate the source code.
+
 ## How It Works
 
 1. The ESP32 boots, connects to WiFi, and registers with Tailscale.
