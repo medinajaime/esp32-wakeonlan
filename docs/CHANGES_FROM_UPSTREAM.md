@@ -9,9 +9,8 @@ of failed experiments. Original code and setup are attributed in
 
 The upstream [medinajaime/esp32-wakeonlan](https://github.com/medinajaime/esp32-wakeonlan)
 provides the ESP32/Tailscale/WoL architecture, setup scripts, UDP trigger and
-magic-packet sender. The local working branch was based on a clone described
-in the lab as upstream revision `e87e3ef`; **verify the full baseline commit
-with `git rev-parse HEAD` before claiming an exact revision**. The available
+magic-packet sender. The validated adaptation commit `4acd135` is based on
+upstream commit `e87e3ef`, as shown by the published Git history. The available
 review includes original/modified source snapshots, accumulated Git diffs
 and device logs; it does not constitute a fully reconstructed upstream-to-head
 patch review of every file in the repository.
@@ -45,21 +44,19 @@ application authorization, guaranteed delivery, high-availability operation,
 or production security. Original setup code, component dependencies and
 third-party copyright notices remain upstream-derived.
 
-## How to compare against the checked-out baseline
+## How to compare the published adaptation with upstream
 
-From the original local Git checkout, before creating the milestone commit:
-
-```powershell
-git rev-parse HEAD
-git status --short
-git diff --cached --ignore-space-at-eol --stat
-git diff --cached --ignore-space-at-eol -- lib/tailscale/src/ts_coordination.c lib/tailscale/src/ts_wireguard.c
-```
-
-For the full staged source delta, run:
+From a clone containing the project's Git history, compare the committed
+baseline to the validated implementation (rather than using staging-only
+diffs from before the milestone commit):
 
 ```powershell
-git diff --cached --ignore-space-at-eol -- lib/tailscale/src lib/tailscale/components/wireguard_lwip/src/wireguardif.c
+# Confirm which upstream commit is the parent of the validated adaptation
+git rev-parse 4acd135^
+
+# Review firmware changes with end-of-line-only differences ignored
+git diff --ignore-space-at-eol --stat e87e3ef 4acd135 -- lib/tailscale/src lib/tailscale/components/wireguard_lwip/src/wireguardif.c
+git diff --ignore-space-at-eol e87e3ef 4acd135 -- lib/tailscale/src/ts_coordination.c lib/tailscale/src/ts_wireguard.c
 ```
 
 Keep source snapshots, patches and private firmware backups outside a public
