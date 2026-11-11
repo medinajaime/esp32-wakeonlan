@@ -80,22 +80,19 @@ const char *ts_state_to_str(ts_state_t state) {
 }
 
 uint8_t ts_peer_find_by_vpn_ip(const ts_t *ml, uint32_t vpn_ip) {
-    uint8_t last_byte = vpn_ip & 0xFF;
-    if (last_byte >= TS_PEER_MAP_SIZE) {
-        return 0xFF;  // Invalid
+    /* The last-octet map is only an acceleration hint; duplicate last
+     * octets are valid, so fall back to the full peer table. */
+    uint8_t hint = ml->peer_map[vpn_ip & 0xFF];
+    if (hint < ml->peer_count && hint < TS_MAX_PEERS &&
+        ml->peers[hint].vpn_ip == vpn_ip) {
+        return hint;
     }
-
-    uint8_t idx = ml->peer_map[last_byte];
-    if (idx >= ml->peer_count) {
-        return 0xFF;  // Not found
+    for (uint8_t idx = 0; idx < ml->peer_count && idx < TS_MAX_PEERS; idx++) {
+        if (ml->peers[idx].vpn_ip == vpn_ip) {
+            return idx;
+        }
     }
-
-    // Verify match
-    if (ml->peers[idx].vpn_ip == vpn_ip) {
-        return idx;
-    }
-
-    return 0xFF;  // Not found
+    return 0xFF;
 }
 
 esp_err_t ts_queue_rx_packet(ts_t *ml, const ts_packet_t *pkt) {
@@ -150,6 +147,7 @@ ts_t *ts_init(const ts_config_t *config) {
 
     // Initialize peer map
     memset(ml->peer_map, 0xFF, sizeof(ml->peer_map));
+    memset(ml->peer_wg_indices, 0xFF, sizeof(ml->peer_wg_indices));
 
     // Set initial state
     ml->state = TS_STATE_IDLE;
@@ -281,6 +279,8 @@ esp_err_t ts_disconnect(ts_t *ml) {
     // Clear state
     ml->vpn_ip = 0;
     ml->peer_count = 0;
+    memset(ml->peer_map, 0xFF, sizeof(ml->peer_map));
+    memset(ml->peer_wg_indices, 0xFF, sizeof(ml->peer_wg_indices));
     memset(&ml->stats, 0, sizeof(ts_stats_t));
 
     // Trigger callback
@@ -399,6 +399,10 @@ bool ts_is_connected(const ts_t *ml) {
     if (!ml) return false;
     return (ml->state == TS_STATE_CONNECTED ||
             ml->state == TS_STATE_MONITORING);
+}
+
+bool ts_is_derp_connected(const ts_t *ml) {
+    return ml != NULL && ml->config.enable_derp && ml->derp.connected;
 }
 
 uint32_t ts_get_vpn_ip(const ts_t *ml) {

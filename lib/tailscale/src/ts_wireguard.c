@@ -243,20 +243,18 @@ static void ts_ip_to_lwip(uint32_t ml_ip, ip_addr_t *lwip_ip) {
     lwip_ip->type = IPADDR_TYPE_V4;
 }
 
-/**
- * @brief Convert lwIP ip_addr_t to Tailscale IP format
- */
-static uint32_t lwip_ip_to_tailscale(const ip_addr_t *lwip_ip) {
-    if (lwip_ip->type != IPADDR_TYPE_V4) {
-        return 0;
+static bool ts_wireguard_peer_index(const ts_t *ml, uint32_t vpn_ip,
+                                    uint8_t *peer_index)
+{
+    uint8_t peer_table_index = ts_peer_find_by_vpn_ip(ml, vpn_ip);
+    if (peer_table_index == 0xFF || peer_table_index >= TS_MAX_PEERS) {
+        return false;
     }
-
-    uint32_t ip = ip4_addr_get_u32(&lwip_ip->u_addr.ip4);
-    // Convert from network byte order to host byte order
-    return ((ip & 0xFF) << 24) |
-           (((ip >> 8) & 0xFF) << 16) |
-           (((ip >> 16) & 0xFF) << 8) |
-           ((ip >> 24) & 0xFF);
+    *peer_index = ml->peer_wg_indices[peer_table_index];
+    if (*peer_index == WIREGUARDIF_INVALID_INDEX) {
+        return false;
+    }
+    return true;
 }
 
 /*
@@ -271,6 +269,118 @@ typedef struct {
     struct wireguardif_init_data init_data;
     err_t result;
 } ts_wg_lwip_op_t;
+
+typedef enum {
+    TS_WG_OP_ADD_PEER,
+    TS_WG_OP_UPDATE_ENDPOINT,
+    TS_WG_OP_CONNECT,
+    TS_WG_OP_CONNECT_DERP,
+    TS_WG_OP_PEER_IS_UP,
+} ts_wg_peer_op_kind_t;
+
+typedef struct {
+    struct netif *netif;
+    ts_wg_peer_op_kind_t kind;
+    struct wireguardif_peer *peer;
+    uint8_t peer_index;
+    ip_addr_t *endpoint_ip;
+    uint16_t endpoint_port;
+    ip_addr_t *current_ip;
+    u16_t *current_port;
+    err_t result;
+    SemaphoreHandle_t done;
+} ts_wg_peer_op_t;
+
+typedef struct {
+    struct netif *netif;
+    struct wireguard_device *device;
+    struct udp_pcb *pcb;
+    struct pbuf *p;
+    uint32_t src_ip;
+    uint16_t src_port;
+    const uint8_t *data;
+    size_t len;
+    bool derp;
+    err_t result;
+    SemaphoreHandle_t done;
+} ts_wg_rx_op_t;
+
+typedef struct {
+    struct netif *netif;
+    uint32_t vpn_ip;
+    err_t result;
+    SemaphoreHandle_t done;
+} ts_wg_ip_op_t;
+
+extern void wireguardif_network_rx(void *arg, struct udp_pcb *pcb,
+                                   struct pbuf *p, const ip_addr_t *addr,
+                                   u16_t port);
+
+static void ts_wg_rx_callback(void *argument)
+{
+    ts_wg_rx_op_t *op = argument;
+    if (op->derp) {
+        ip_addr_t src_addr;
+        IP_ADDR4(&src_addr, 0, 0, 0, 0);
+        wireguardif_network_rx(op->device, op->pcb, op->p, &src_addr, 41641);
+        op->result = ERR_OK;
+    } else {
+        op->result = wireguardif_inject_packet(op->netif, op->src_ip,
+                                               op->src_port, op->data, op->len);
+    }
+    xSemaphoreGive(op->done);
+}
+
+static void ts_wg_ip_callback(void *argument)
+{
+    ts_wg_ip_op_t *op = argument;
+    ip4_addr_t ip4addr;
+    IP4_ADDR(&ip4addr,
+             (op->vpn_ip >> 24) & 0xFF,
+             (op->vpn_ip >> 16) & 0xFF,
+             (op->vpn_ip >> 8) & 0xFF,
+             op->vpn_ip & 0xFF);
+    ip4_addr_set(&op->netif->ip_addr.u_addr.ip4, &ip4addr);
+    op->result = ERR_OK;
+    xSemaphoreGive(op->done);
+}
+
+static void ts_wg_peer_callback(void *argument)
+{
+    ts_wg_peer_op_t *op = argument;
+    switch (op->kind) {
+        case TS_WG_OP_ADD_PEER:
+            op->result = wireguardif_add_peer(op->netif, op->peer,
+                                              &op->peer_index);
+            break;
+        case TS_WG_OP_UPDATE_ENDPOINT:
+            op->result = wireguardif_update_endpoint(op->netif, op->peer_index,
+                                                     op->endpoint_ip,
+                                                     op->endpoint_port);
+            break;
+        case TS_WG_OP_CONNECT:
+            op->result = wireguardif_connect(op->netif, op->peer_index);
+            break;
+        case TS_WG_OP_CONNECT_DERP:
+            op->result = wireguardif_connect_derp(op->netif, op->peer_index);
+            break;
+        case TS_WG_OP_PEER_IS_UP:
+            op->result = wireguardif_peer_is_up(op->netif, op->peer_index,
+                                                op->current_ip,
+                                                op->current_port);
+            break;
+    }
+    xSemaphoreGive(op->done);
+}
+
+static err_t ts_wg_peer_call(ts_wg_peer_op_t *op)
+{
+    if (tcpip_callback(ts_wg_peer_callback, op) != ERR_OK) {
+        return ERR_IF;
+    }
+    (void)xSemaphoreTake(op->done, portMAX_DELAY);
+    return op->result;
+}
 
 static void ts_wg_lwip_init_callback(void *argument) {
     ts_wg_lwip_op_t *op = (ts_wg_lwip_op_t *)argument;
@@ -502,8 +612,19 @@ esp_err_t ts_wireguard_add_peer(ts_t *ml, const ts_peer_t *peer) {
     wg_peer.keep_alive = 25;
 
     // Add peer to WireGuard interface
-    u8_t peer_index = WIREGUARDIF_INVALID_INDEX;
-    err_t err = wireguardif_add_peer((struct netif *)ml->wireguard.netif, &wg_peer, &peer_index);
+    SemaphoreHandle_t done = xSemaphoreCreateBinary();
+    if (!done) return ESP_ERR_NO_MEM;
+    ts_wg_peer_op_t peer_op = {
+        .netif = (struct netif *)ml->wireguard.netif,
+        .kind = TS_WG_OP_ADD_PEER,
+        .peer = &wg_peer,
+        .peer_index = WIREGUARDIF_INVALID_INDEX,
+        .done = done,
+        .result = ERR_IF,
+    };
+    err_t err = ts_wg_peer_call(&peer_op);
+    u8_t peer_index = peer_op.peer_index;
+    vSemaphoreDelete(done);
 
     if (err != ERR_OK) {
         ESP_LOGE(TAG, "Failed to add peer: lwIP error %d", err);
@@ -511,10 +632,12 @@ esp_err_t ts_wireguard_add_peer(ts_t *ml, const ts_peer_t *peer) {
     }
 
     // Store peer index for later reference
-    uint8_t last_byte = peer->vpn_ip & 0xFF;
-    if (last_byte < TS_PEER_MAP_SIZE) {
-        ml->peer_map[last_byte] = peer_index;
+    uint8_t peer_table_index = (uint8_t)(peer - ml->peers);
+    if (peer_table_index >= TS_MAX_PEERS) {
+        ESP_LOGE(TAG, "Peer table index is invalid");
+        return ESP_FAIL;
     }
+    ml->peer_wg_indices[peer_table_index] = peer_index;
 
     ESP_LOGI(TAG, "Peer added successfully (index %d)", peer_index);
 
@@ -527,14 +650,25 @@ esp_err_t ts_wireguard_add_peer(ts_t *ml, const ts_peer_t *peer) {
     // - Once handshake completes via DERP, traffic flows immediately
     // - DISCO will upgrade to direct path in background if possible
     ESP_LOGI(TAG, "Initiating handshake via DERP (reliable, bypasses NAT)");
-    err = wireguardif_connect_derp((struct netif *)ml->wireguard.netif, peer_index);
+    done = xSemaphoreCreateBinary();
+    if (!done) return ESP_ERR_NO_MEM;
+    peer_op.kind = TS_WG_OP_CONNECT_DERP;
+    peer_op.peer_index = peer_index;
+    peer_op.done = done;
+    err = ts_wg_peer_call(&peer_op);
+    vSemaphoreDelete(done);
     if (err != ERR_OK) {
         ESP_LOGW(TAG, "Failed to initiate DERP handshake: lwIP error %d", err);
 
         // Fallback: try direct if DERP fails and we have an endpoint
         if (peer->endpoint_count > 0 && !peer->endpoints[0].is_derp) {
             ESP_LOGI(TAG, "DERP failed, trying direct handshake as fallback");
-            err = wireguardif_connect((struct netif *)ml->wireguard.netif, peer_index);
+            done = xSemaphoreCreateBinary();
+            if (!done) return ESP_ERR_NO_MEM;
+            peer_op.kind = TS_WG_OP_CONNECT;
+            peer_op.done = done;
+            err = ts_wg_peer_call(&peer_op);
+            vSemaphoreDelete(done);
             if (err == ERR_OK) {
                 uint32_t ip = ntohl(peer->endpoints[0].addr.ip4);
                 ESP_LOGI(TAG, "Direct handshake initiated to %lu.%lu.%lu.%lu:%u",
@@ -565,13 +699,8 @@ esp_err_t ts_wireguard_update_endpoint(ts_t *ml, uint32_t vpn_ip,
     }
 
     // Find peer index by VPN IP
-    uint8_t last_byte = vpn_ip & 0xFF;
-    if (last_byte >= TS_PEER_MAP_SIZE) {
-        return ESP_ERR_NOT_FOUND;
-    }
-
-    uint8_t peer_index = ml->peer_map[last_byte];
-    if (peer_index == 0xFF) {
+    uint8_t peer_index;
+    if (!ts_wireguard_peer_index(ml, vpn_ip, &peer_index)) {
         return ESP_ERR_NOT_FOUND;
     }
 
@@ -580,8 +709,19 @@ esp_err_t ts_wireguard_update_endpoint(ts_t *ml, uint32_t vpn_ip,
     ts_ip_to_lwip(endpoint_ip, &lwip_endpoint);
 
     // Update peer endpoint
-    err_t err = wireguardif_update_endpoint((struct netif *)ml->wireguard.netif,
-                                             peer_index, &lwip_endpoint, endpoint_port);
+    SemaphoreHandle_t done = xSemaphoreCreateBinary();
+    if (!done) return ESP_ERR_NO_MEM;
+    ts_wg_peer_op_t peer_op = {
+        .netif = (struct netif *)ml->wireguard.netif,
+        .kind = TS_WG_OP_UPDATE_ENDPOINT,
+        .peer_index = peer_index,
+        .endpoint_ip = &lwip_endpoint,
+        .endpoint_port = endpoint_port,
+        .done = done,
+        .result = ERR_IF,
+    };
+    err_t err = ts_wg_peer_call(&peer_op);
+    vSemaphoreDelete(done);
     if (err != ERR_OK) {
         ESP_LOGE(TAG, "Failed to update endpoint: lwIP error %d", err);
         return ESP_FAIL;
@@ -595,7 +735,12 @@ esp_err_t ts_wireguard_update_endpoint(ts_t *ml, uint32_t vpn_ip,
              endpoint_port);
 
     // Now initiate handshake with the new endpoint
-    err = wireguardif_connect((struct netif *)ml->wireguard.netif, peer_index);
+    done = xSemaphoreCreateBinary();
+    if (!done) return ESP_ERR_NO_MEM;
+    peer_op.kind = TS_WG_OP_CONNECT;
+    peer_op.done = done;
+    err = ts_wg_peer_call(&peer_op);
+    vSemaphoreDelete(done);
     if (err != ERR_OK) {
         ESP_LOGW(TAG, "Failed to initiate handshake after endpoint update: %d", err);
         return ESP_FAIL;
@@ -621,14 +766,8 @@ esp_err_t ts_wireguard_trigger_handshake(ts_t *ml, uint32_t vpn_ip) {
     }
 
     // Find peer index
-    uint8_t last_byte = vpn_ip & 0xFF;
-    if (last_byte >= TS_PEER_MAP_SIZE) {
-        ESP_LOGW(TAG, "Invalid VPN IP for handshake: %lu", (unsigned long)vpn_ip);
-        return ESP_ERR_NOT_FOUND;
-    }
-
-    uint8_t peer_index = ml->peer_map[last_byte];
-    if (peer_index == 0xFF) {
+    uint8_t peer_index;
+    if (!ts_wireguard_peer_index(ml, vpn_ip, &peer_index)) {
         ESP_LOGW(TAG, "Peer not found for VPN IP: %lu.%lu.%lu.%lu",
                  (unsigned long)((vpn_ip >> 24) & 0xFF),
                  (unsigned long)((vpn_ip >> 16) & 0xFF),
@@ -639,8 +778,21 @@ esp_err_t ts_wireguard_trigger_handshake(ts_t *ml, uint32_t vpn_ip) {
 
     // Check if peer already has a valid session - if so, don't destroy it by initiating new handshake!
     ip_addr_t current_ip;
-    u16_t current_port;
-    err_t status = wireguardif_peer_is_up((struct netif *)ml->wireguard.netif, peer_index, &current_ip, &current_port);
+    memset(&current_ip, 0, sizeof(current_ip));
+    u16_t current_port = 0;
+    SemaphoreHandle_t done = xSemaphoreCreateBinary();
+    if (!done) return ESP_ERR_NO_MEM;
+    ts_wg_peer_op_t peer_op = {
+        .netif = (struct netif *)ml->wireguard.netif,
+        .kind = TS_WG_OP_PEER_IS_UP,
+        .peer_index = peer_index,
+        .current_ip = &current_ip,
+        .current_port = &current_port,
+        .done = done,
+        .result = ERR_IF,
+    };
+    err_t status = ts_wg_peer_call(&peer_op);
+    vSemaphoreDelete(done);
 
     if (status == ERR_OK) {
         // Peer already has a valid keypair! Don't destroy it by initiating a new handshake.
@@ -654,6 +806,15 @@ esp_err_t ts_wireguard_trigger_handshake(ts_t *ml, uint32_t vpn_ip) {
         return ESP_OK;
     }
 
+    if (status != ERR_CONN) {
+        ESP_LOGW(TAG, "Cannot inspect WireGuard peer %lu.%lu.%lu.%lu: lwIP error %d",
+                 (unsigned long)((vpn_ip >> 24) & 0xFF),
+                 (unsigned long)((vpn_ip >> 16) & 0xFF),
+                 (unsigned long)((vpn_ip >> 8) & 0xFF),
+                 (unsigned long)(vpn_ip & 0xFF), status);
+        return ESP_FAIL;
+    }
+
     ESP_LOGI(TAG, "Triggering WireGuard handshake to peer %lu.%lu.%lu.%lu (index=%d)",
              (unsigned long)((vpn_ip >> 24) & 0xFF),
              (unsigned long)((vpn_ip >> 16) & 0xFF),
@@ -664,7 +825,12 @@ esp_err_t ts_wireguard_trigger_handshake(ts_t *ml, uint32_t vpn_ip) {
     // If peer has a non-zero endpoint, try direct connect first
     if (!ip_addr_isany(&current_ip) && current_port != 0) {
         ESP_LOGI(TAG, "Peer has direct endpoint, using wireguardif_connect");
-        err_t err = wireguardif_connect((struct netif *)ml->wireguard.netif, peer_index);
+        done = xSemaphoreCreateBinary();
+        if (!done) return ESP_ERR_NO_MEM;
+        peer_op.kind = TS_WG_OP_CONNECT;
+        peer_op.done = done;
+        err_t err = ts_wg_peer_call(&peer_op);
+        vSemaphoreDelete(done);
         if (err == ERR_OK) {
             ESP_LOGI(TAG, "Direct handshake initiated");
             return ESP_OK;
@@ -672,14 +838,24 @@ esp_err_t ts_wireguard_trigger_handshake(ts_t *ml, uint32_t vpn_ip) {
     }
 
     // No direct endpoint or direct failed - use DERP
-    err_t err = wireguardif_connect_derp((struct netif *)ml->wireguard.netif, peer_index);
+    done = xSemaphoreCreateBinary();
+    if (!done) return ESP_ERR_NO_MEM;
+    peer_op.kind = TS_WG_OP_CONNECT_DERP;
+    peer_op.done = done;
+    err_t err = ts_wg_peer_call(&peer_op);
+    vSemaphoreDelete(done);
     if (err == ERR_OK) {
         ESP_LOGI(TAG, "DERP handshake initiated");
         return ESP_OK;
     }
 
     // Fallback to direct if DERP also failed
-    err = wireguardif_connect((struct netif *)ml->wireguard.netif, peer_index);
+    done = xSemaphoreCreateBinary();
+    if (!done) return ESP_ERR_NO_MEM;
+    peer_op.kind = TS_WG_OP_CONNECT;
+    peer_op.done = done;
+    err = ts_wg_peer_call(&peer_op);
+    vSemaphoreDelete(done);
     if (err == ERR_OK) {
         ESP_LOGI(TAG, "Direct handshake initiated (fallback)");
         return ESP_OK;
@@ -700,20 +876,27 @@ esp_err_t ts_wireguard_send(ts_t *ml, uint32_t dest_vpn_ip,
     }
 
     // Find peer index
-    uint8_t last_byte = dest_vpn_ip & 0xFF;
-    if (last_byte >= TS_PEER_MAP_SIZE) {
-        return ESP_ERR_NOT_FOUND;
-    }
-
-    uint8_t peer_index = ml->peer_map[last_byte];
-    if (peer_index == 0xFF) {
+    uint8_t peer_index;
+    if (!ts_wireguard_peer_index(ml, dest_vpn_ip, &peer_index)) {
         return ESP_ERR_NOT_FOUND;
     }
 
     // Check if peer is up
     ip_addr_t peer_ip;
     u16_t peer_port;
-    err_t err = wireguardif_peer_is_up((struct netif *)ml->wireguard.netif, peer_index, &peer_ip, &peer_port);
+    SemaphoreHandle_t done = xSemaphoreCreateBinary();
+    if (!done) return ESP_ERR_NO_MEM;
+    ts_wg_peer_op_t peer_op = {
+        .netif = (struct netif *)ml->wireguard.netif,
+        .kind = TS_WG_OP_PEER_IS_UP,
+        .peer_index = peer_index,
+        .current_ip = &peer_ip,
+        .current_port = &peer_port,
+        .done = done,
+        .result = ERR_IF,
+    };
+    err_t err = ts_wg_peer_call(&peer_op);
+    vSemaphoreDelete(done);
 
     if (err != ERR_OK) {
         ESP_LOGD(TAG, "Peer not ready, handshake may be in progress");
@@ -809,19 +992,31 @@ esp_err_t ts_wireguard_inject_derp_packet(ts_t *ml, uint32_t src_ip,
     // With 0.0.0.0, update_peer_addr() skips the update (it guards against any()),
     // peer->ip stays 0.0.0.0 (as set by wireguardif_connect_derp()), and
     // wireguardif_peer_output() correctly routes all responses through DERP.
-    ip_addr_t src_addr;
-    IP_ADDR4(&src_addr, 0, 0, 0, 0);
     ESP_LOGD(TAG, "Injecting DERP WG packet (src_vpn_ip=0x%08lx kept internal)", (unsigned long)src_ip);
 
-    // Call wireguard-lwip's network receive function
-    // This processes the packet just like it came from UDP
-    extern void wireguardif_network_rx(void *arg, struct udp_pcb *pcb,
-                                        struct pbuf *p, const ip_addr_t *addr, u16_t port);
-    wireguardif_network_rx(device, device->udp_pcb, p, &src_addr, 41641);
+    SemaphoreHandle_t done = xSemaphoreCreateBinary();
+    if (!done) {
+        pbuf_free(p);
+        return ESP_ERR_NO_MEM;
+    }
+    ts_wg_rx_op_t rx_op = {
+        .netif = netif,
+        .device = device,
+        .pcb = device->udp_pcb,
+        .p = p,
+        .derp = true,
+        .done = done,
+        .result = ERR_IF,
+    };
+    if (tcpip_callback(ts_wg_rx_callback, &rx_op) != ERR_OK) {
+        vSemaphoreDelete(done);
+        pbuf_free(p);
+        return ESP_FAIL;
+    }
+    (void)xSemaphoreTake(done, portMAX_DELAY);
+    vSemaphoreDelete(done);
 
-    // Note: wireguardif_network_rx frees the pbuf
-
-    return ESP_OK;
+    return rx_op.result == ERR_OK ? ESP_OK : ESP_FAIL;
 }
 
 esp_err_t ts_wireguard_inject_packet(ts_t *ml, uint32_t src_ip, uint16_t src_port,
@@ -832,8 +1027,24 @@ esp_err_t ts_wireguard_inject_packet(ts_t *ml, uint32_t src_ip, uint16_t src_por
 
     struct netif *netif = (struct netif *)ml->wireguard.netif;
 
-    // Use the wireguardif library's inject function which properly handles src_port
-    err_t err = wireguardif_inject_packet(netif, src_ip, src_port, data, len);
+    SemaphoreHandle_t done = xSemaphoreCreateBinary();
+    if (!done) return ESP_ERR_NO_MEM;
+    ts_wg_rx_op_t rx_op = {
+        .netif = netif,
+        .src_ip = src_ip,
+        .src_port = src_port,
+        .data = data,
+        .len = len,
+        .done = done,
+        .result = ERR_IF,
+    };
+    if (tcpip_callback(ts_wg_rx_callback, &rx_op) != ERR_OK) {
+        vSemaphoreDelete(done);
+        return ESP_FAIL;
+    }
+    (void)xSemaphoreTake(done, portMAX_DELAY);
+    vSemaphoreDelete(done);
+    err_t err = rx_op.result;
 
     if (err != ERR_OK) {
         ESP_LOGW(TAG, "wireguardif_inject_packet failed: %d", err);
@@ -1001,17 +1212,23 @@ esp_err_t ts_wireguard_set_vpn_ip(ts_t *ml, uint32_t vpn_ip) {
 
     struct netif *netif = (struct netif *)ml->wireguard.netif;
 
-    // Convert to lwIP format
-    ip4_addr_t ip4addr;
-    IP4_ADDR(&ip4addr,
-             (vpn_ip >> 24) & 0xFF,
-             (vpn_ip >> 16) & 0xFF,
-             (vpn_ip >> 8) & 0xFF,
-             vpn_ip & 0xFF);
-
-    // Directly set the IP without triggering callbacks
-    // This avoids the ESP-IDF esp_netif callback crash
-    ip4_addr_set(&netif->ip_addr.u_addr.ip4, &ip4addr);
+    SemaphoreHandle_t done = xSemaphoreCreateBinary();
+    if (!done) return ESP_ERR_NO_MEM;
+    ts_wg_ip_op_t ip_op = {
+        .netif = netif,
+        .vpn_ip = vpn_ip,
+        .result = ERR_IF,
+        .done = done,
+    };
+    if (tcpip_callback(ts_wg_ip_callback, &ip_op) != ERR_OK) {
+        vSemaphoreDelete(done);
+        return ESP_FAIL;
+    }
+    (void)xSemaphoreTake(done, portMAX_DELAY);
+    vSemaphoreDelete(done);
+    if (ip_op.result != ERR_OK) {
+        return ESP_FAIL;
+    }
 
     ml->vpn_ip = vpn_ip;
 

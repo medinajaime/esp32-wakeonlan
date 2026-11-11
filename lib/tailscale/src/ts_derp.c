@@ -73,6 +73,8 @@ static bool derp_rng_initialized = false;
 
 /* Receive buffer */
 static uint8_t derp_rx_buffer[DERP_MAX_FRAME_SIZE];
+/* Prevent a second receiver from overwriting the frame being processed. */
+static bool derp_frame_processing = false;
 
 /* Server's public key (received during handshake) */
 static uint8_t derp_server_key[DERP_SERVER_KEY_LEN];
@@ -84,6 +86,31 @@ static const char *current_derp_server = TS_DERP_SERVER;
 /* Both read and write must be protected - concurrent access causes deadlock/corruption */
 static SemaphoreHandle_t derp_tls_mutex = NULL;
 static StaticSemaphore_t derp_tls_mutex_buffer;
+static portMUX_TYPE derp_mutex_init_lock = portMUX_INITIALIZER_UNLOCKED;
+
+static SemaphoreHandle_t derp_get_tls_mutex(void)
+{
+    portENTER_CRITICAL(&derp_mutex_init_lock);
+    if (derp_tls_mutex == NULL) {
+        derp_tls_mutex = xSemaphoreCreateMutexStatic(&derp_tls_mutex_buffer);
+    }
+    SemaphoreHandle_t mutex = derp_tls_mutex;
+    portEXIT_CRITICAL(&derp_mutex_init_lock);
+    return mutex;
+}
+
+static void derp_wait_for_frame_processing(void)
+{
+    SemaphoreHandle_t mutex = derp_get_tls_mutex();
+    for (;;) {
+        (void)xSemaphoreTake(mutex, portMAX_DELAY);
+        if (!derp_frame_processing) {
+            return;
+        }
+        xSemaphoreGive(mutex);
+        vTaskDelay(pdMS_TO_TICKS(1));
+    }
+}
 
 /**
  * @brief Write exact number of bytes to TLS
@@ -200,14 +227,9 @@ static int derp_tls_read_all(ts_t *ml, uint8_t *data, size_t len, int timeout_ms
 static esp_err_t derp_send_frame(ts_t *ml, uint8_t type, const uint8_t *payload, uint32_t len) {
     ESP_LOGD(TAG, "[FRAME] >> type=0x%02x len=%lu", type, (unsigned long)len);
 
-    // Initialize mutex on first use (static allocation for RTOS safety)
-    if (derp_tls_mutex == NULL) {
-        ESP_LOGD(TAG, "[FRAME] Creating TLS mutex");
-        derp_tls_mutex = xSemaphoreCreateMutexStatic(&derp_tls_mutex_buffer);
-        if (derp_tls_mutex == NULL) {
-            ESP_LOGE(TAG, "Failed to create DERP TLS mutex");
-            return ESP_FAIL;
-        }
+    if (derp_get_tls_mutex() == NULL) {
+        ESP_LOGE(TAG, "Failed to create DERP TLS mutex");
+        return ESP_FAIL;
     }
 
     // Take mutex with SHORT timeout - if receive is in progress, skip this send
@@ -219,6 +241,13 @@ static esp_err_t derp_send_frame(ts_t *ml, uint8_t type, const uint8_t *payload,
         return ESP_ERR_TIMEOUT;
     }
     ESP_LOGD(TAG, "[FRAME] TLS mutex OK");
+
+    /* CLIENT_INFO is sent during initial connection setup, before connected
+     * is published. Every other frame requires a live, revalidated session. */
+    if (!ml->derp.connected && type != FRAME_CLIENT_INFO) {
+        xSemaphoreGive(derp_tls_mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
 
     esp_err_t result = ESP_OK;
     uint8_t header[5];
@@ -540,8 +569,10 @@ esp_err_t ts_derp_init(ts_t *ml) {
 esp_err_t ts_derp_deinit(ts_t *ml) {
     ESP_LOGI(TAG, "Deinitializing DERP client");
 
+    derp_wait_for_frame_processing();
     if (ml->derp.connected) {
         mbedtls_ssl_close_notify(&ml->derp.ssl);
+        ml->derp.connected = false;
     }
 
     mbedtls_ssl_free(&ml->derp.ssl);
@@ -555,6 +586,8 @@ esp_err_t ts_derp_deinit(ts_t *ml) {
 
     memset(&ml->derp, 0, sizeof(ts_derp_t));
     ml->derp.sockfd = -1;
+
+    xSemaphoreGive(derp_tls_mutex);
 
     return ESP_OK;
 }
@@ -834,6 +867,7 @@ fail:
 esp_err_t ts_derp_reconnect(ts_t *ml) {
     ESP_LOGI(TAG, "Reconnecting DERP relay (coordination session refreshed)...");
 
+    derp_wait_for_frame_processing();
     // Close existing connection if any
     if (ml->derp.connected) {
         ESP_LOGI(TAG, "Closing stale DERP connection");
@@ -851,6 +885,8 @@ esp_err_t ts_derp_reconnect(ts_t *ml) {
     mbedtls_net_init(&derp_server_fd);
     mbedtls_ssl_init(&ml->derp.ssl);
     mbedtls_ssl_config_init(&ml->derp.ssl_conf);
+
+    xSemaphoreGive(derp_tls_mutex);
 
     // Small delay to let server-side cleanup
     vTaskDelay(pdMS_TO_TICKS(1000));
@@ -956,18 +992,25 @@ esp_err_t ts_derp_receive(ts_t *ml) {
     }
 
     // Initialize mutex if needed (same mutex as send uses)
-    if (derp_tls_mutex == NULL) {
-        derp_tls_mutex = xSemaphoreCreateMutexStatic(&derp_tls_mutex_buffer);
-        if (derp_tls_mutex == NULL) {
-            ESP_LOGE(TAG, "Failed to create DERP TLS mutex in receive");
-            return ESP_FAIL;
-        }
+    if (derp_get_tls_mutex() == NULL) {
+        ESP_LOGE(TAG, "Failed to create DERP TLS mutex in receive");
+        return ESP_FAIL;
     }
 
     // Take mutex for TLS read operations - use short timeout
     // If send is in progress, skip this receive cycle
     if (xSemaphoreTake(derp_tls_mutex, pdMS_TO_TICKS(10)) != pdTRUE) {
         // Send is in progress, skip receive this cycle
+        return ESP_OK;
+    }
+
+    if (!ml->derp.connected) {
+        xSemaphoreGive(derp_tls_mutex);
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    if (derp_frame_processing) {
+        xSemaphoreGive(derp_tls_mutex);
         return ESP_OK;
     }
 
@@ -1004,7 +1047,10 @@ esp_err_t ts_derp_receive(ts_t *ml) {
         }
     }
 
-    // Release mutex - we've read all the data we need
+    /* Keep ownership of derp_rx_buffer through classification and injection.
+     * The flag is checked while holding the TLS mutex, so re-entry cannot
+     * start another read until this caller finishes processing. */
+    derp_frame_processing = true;
     xSemaphoreGive(derp_tls_mutex);
 
     // Log ALL incoming frames for debugging
@@ -1026,8 +1072,12 @@ esp_err_t ts_derp_receive(ts_t *ml) {
             // Check if this is a DISCO packet (starts with "TS💬" magic)
             // DISCO packets must be routed to the DISCO handler, NOT WireGuard
             if (ts_disco_is_disco_packet(payload, payload_len)) {
-                ESP_LOGI(TAG, "Received DISCO packet via DERP (%u bytes)", (unsigned int)payload_len);
-                ts_disco_handle_derp_packet(ml, src_key, payload, payload_len);
+                if (ml->config.enable_disco) {
+                    ESP_LOGI(TAG, "Received DISCO packet via DERP (%u bytes)", (unsigned int)payload_len);
+                    ts_disco_handle_derp_packet(ml, src_key, payload, payload_len);
+                } else {
+                    ESP_LOGD(TAG, "Dropping DISCO packet while DISCO is disabled");
+                }
                 break;
             }
 
@@ -1125,6 +1175,11 @@ esp_err_t ts_derp_receive(ts_t *ml) {
             ESP_LOGD(TAG, "Unknown frame type: 0x%02x len=%lu", type, len);
             break;
     }
+
+        if (xSemaphoreTake(derp_tls_mutex, portMAX_DELAY) == pdTRUE) {
+            derp_frame_processing = false;
+            xSemaphoreGive(derp_tls_mutex);
+        }
 
     return ESP_OK;
 }

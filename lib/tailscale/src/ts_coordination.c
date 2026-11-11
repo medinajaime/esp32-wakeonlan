@@ -3304,6 +3304,7 @@ esp_err_t ts_coordination_fetch_peers(ts_t *ml) {
         ml->peer_count = 0;
         memset(ml->peers, 0, sizeof(ml->peers));
         memset(ml->peer_map, 0xFF, sizeof(ml->peer_map));  // 0xFF = invalid index
+        memset(ml->peer_wg_indices, 0xFF, sizeof(ml->peer_wg_indices));
 
         // Parse each peer (up to TS_MAX_PEERS)
         int added_peers = 0;

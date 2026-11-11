@@ -231,12 +231,10 @@ static err_t wireguardif_output_to_peer(struct netif *netif, struct pbuf *q, con
 
 	if (keypair->valid && (keypair->initiator || keypair->last_rx != 0)) {
 		// More debug: check expiry
-		uint32_t now_ms = wireguard_sys_now();
-		uint32_t age_ms = now_ms - keypair->keypair_millis;
 		bool expired = wireguard_expired(keypair->keypair_millis, REJECT_AFTER_TIME);
-		WG_DEBUG("[WG_TX_DEBUG] keypair_millis=%lu, now=%lu, age_ms=%lu, expired=%d, counter=%lu\n",
-		       (unsigned long)keypair->keypair_millis, (unsigned long)now_ms,
-		       (unsigned long)age_ms, expired, (unsigned long)keypair->sending_counter);
+		WG_DEBUG("[WG_TX_DEBUG] keypair_millis=%lu, now=%lu, expired=%d, counter=%lu\n",
+		       (unsigned long)keypair->keypair_millis, (unsigned long)wireguard_sys_now(),
+		       expired, (unsigned long)keypair->sending_counter);
 
 		if (
 				!expired &&
