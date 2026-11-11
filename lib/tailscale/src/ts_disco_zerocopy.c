@@ -1045,7 +1045,7 @@ esp_err_t ts_disco_handle_direct_packet(ts_t *ml, const uint8_t *data, size_t le
  * ========================================================================== */
 
 esp_err_t ts_disco_send_call_me_maybe(ts_t *ml, uint32_t peer_vpn_ip) {
-    if (!ml || !ml->derp.connected) {
+    if (!ml || !ml->config.enable_disco || !ml->derp.connected) {
         return ESP_ERR_INVALID_STATE;
     }
 

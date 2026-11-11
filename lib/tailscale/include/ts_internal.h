@@ -217,6 +217,7 @@ struct ts_context {
     ts_peer_t peers[TS_MAX_PEERS];
     uint8_t peer_count;
     uint8_t peer_map[TS_PEER_MAP_SIZE];  // vpn_ip_last_byte -> peer index
+    uint8_t peer_wg_indices[TS_MAX_PEERS]; // peer table index -> WireGuard slot
 
     // Subsystems
     ts_coordination_t coordination;

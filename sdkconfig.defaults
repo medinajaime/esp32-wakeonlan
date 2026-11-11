@@ -1,4 +1,4 @@
-# sdkconfig.defaults — NodeMCU-32S / ESP32S (no PSRAM)
+# sdkconfig.defaults — tested ESP32-WROOM-32D dev kit (no PSRAM)
 # Based on MicroLink examples/ping_pong_esp32/sdkconfig.defaults (original upstream)
 
 # ── TLS / HTTPS (required for Tailscale coordination) ────────────────────────
@@ -29,7 +29,7 @@ CONFIG_LWIP_TCP_RECVMBOX_SIZE=6
 CONFIG_LWIP_UDP_RECVMBOX_SIZE=6
 
 # ── Memory ────────────────────────────────────────────────────────────────────
-# No PSRAM on NodeMCU-32S — intentionally NOT setting CONFIG_SPIRAM
+# No PSRAM on the tested ESP32-WROOM-32D dev kit — CONFIG_SPIRAM is not enabled
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=6144
 
 # ── Tailscale — tuned for minimal SRAM usage ─────────────────────────────────

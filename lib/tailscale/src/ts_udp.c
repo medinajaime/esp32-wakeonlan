@@ -25,6 +25,7 @@
 #include "lwip/pbuf.h"
 #include "lwip/netif.h"
 #include "lwip/ip_addr.h"
+#include "lwip/tcpip.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -71,8 +72,84 @@ struct ts_udp_socket {
 
     // RX task handle
     TaskHandle_t rx_task_handle;
+    SemaphoreHandle_t rx_exit_sem;
+    SemaphoreHandle_t lwip_done;
     volatile bool rx_task_running;
 };
+
+typedef struct {
+    ts_udp_socket_t *sock;
+    SemaphoreHandle_t done;
+    err_t result;
+} udp_lwip_op_t;
+
+typedef struct {
+    ts_udp_socket_t *sock;
+    SemaphoreHandle_t done;
+    ip_addr_t dest_addr;
+    uint16_t dest_port;
+    const void *data;
+    size_t len;
+    err_t result;
+} udp_send_op_t;
+
+static void ts_ip_to_lwip(uint32_t ml_ip, ip_addr_t *lwip_ip);
+static void udp_recv_callback(void *arg, struct udp_pcb *pcb, struct pbuf *p,
+                               const ip_addr_t *addr, u16_t port);
+
+static void udp_create_callback(void *arg)
+{
+    udp_lwip_op_t *op = arg;
+    ts_udp_socket_t *sock = op->sock;
+
+    sock->pcb = udp_new();
+    op->result = sock->pcb ? ERR_OK : ERR_MEM;
+    if (op->result == ERR_OK && sock->ml->wireguard.netif) {
+        udp_bind_netif(sock->pcb, (struct netif *)sock->ml->wireguard.netif);
+    }
+    if (op->result == ERR_OK) {
+        ip_addr_t local_ip;
+        ts_ip_to_lwip(sock->ml->vpn_ip, &local_ip);
+        op->result = udp_bind(sock->pcb, &local_ip, sock->local_port);
+    }
+    if (op->result == ERR_OK) {
+        sock->local_port = sock->pcb->local_port;
+        udp_recv(sock->pcb, udp_recv_callback, sock);
+    } else if (sock->pcb) {
+        udp_remove(sock->pcb);
+        sock->pcb = NULL;
+    }
+    xSemaphoreGive(op->done);
+}
+
+static void udp_close_callback(void *arg)
+{
+    udp_lwip_op_t *op = arg;
+    if (op->sock->pcb) {
+        udp_recv(op->sock->pcb, NULL, NULL);
+        udp_remove(op->sock->pcb);
+        op->sock->pcb = NULL;
+    }
+    op->result = ERR_OK;
+    xSemaphoreGive(op->done);
+}
+
+static void udp_send_callback(void *arg)
+{
+    udp_send_op_t *op = arg;
+    struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, op->len, PBUF_RAM);
+    if (!p) {
+        op->result = ERR_MEM;
+    } else {
+        op->result = pbuf_take(p, op->data, op->len);
+        if (op->result == ERR_OK) {
+            op->result = udp_sendto(op->sock->pcb, p, &op->dest_addr,
+                                    op->dest_port);
+        }
+        pbuf_free(p);
+    }
+    xSemaphoreGive(op->done);
+}
 
 /* ============================================================================
  * Helper Functions
@@ -200,6 +277,7 @@ static void udp_rx_task(void *arg) {
     }
 
     ESP_LOGI(TAG, "[UDP_RX] Task exiting");
+    xSemaphoreGive(sock->rx_exit_sem);
     vTaskDelete(NULL);
 }
 
@@ -248,48 +326,53 @@ ts_udp_socket_t *ts_udp_create(ts_t *ml, uint16_t local_port) {
     sock->rx_callback = NULL;
     sock->rx_callback_arg = NULL;
     sock->rx_task_handle = NULL;
+    sock->rx_exit_sem = xSemaphoreCreateBinary();
     sock->rx_task_running = false;
+
+    if (!sock->rx_exit_sem) {
+        free(sock);
+        return NULL;
+    }
 
     // Create counting semaphore for RX notification
     // Use counting semaphore (not binary) so multiple packet arrivals don't lose signals
     sock->rx_sem = xSemaphoreCreateCounting(UDP_RX_QUEUE_SIZE, 0);
     if (!sock->rx_sem) {
         ESP_LOGE(TAG, "Failed to create RX semaphore");
+        vSemaphoreDelete(sock->rx_exit_sem);
         free(sock);
         return NULL;
     }
 
-    // Create lwIP UDP PCB for receiving
-    sock->pcb = udp_new();
-    if (!sock->pcb) {
-        ESP_LOGE(TAG, "Failed to create UDP PCB");
+    sock->lwip_done = xSemaphoreCreateBinary();
+    if (!sock->lwip_done) {
         vSemaphoreDelete(sock->rx_sem);
+        vSemaphoreDelete(sock->rx_exit_sem);
         free(sock);
         return NULL;
     }
-
-    // Bind to WireGuard netif if available
-    if (ml->wireguard.netif) {
-        udp_bind_netif(sock->pcb, (struct netif *)ml->wireguard.netif);
-    }
-
-    // Bind to local IP and port
-    ip_addr_t local_ip;
-    ts_ip_to_lwip(ml->vpn_ip, &local_ip);
-
-    err_t err = udp_bind(sock->pcb, &local_ip, local_port);
-    if (err != ERR_OK) {
-        ESP_LOGE(TAG, "udp_bind() failed: %d", err);
-        udp_remove(sock->pcb);
+    udp_lwip_op_t lwip_op = {
+        .sock = sock,
+        .done = sock->lwip_done,
+        .result = ERR_IF,
+    };
+    sock->local_port = local_port;
+    if (tcpip_callback(udp_create_callback, &lwip_op) != ERR_OK) {
+        vSemaphoreDelete(sock->lwip_done);
         vSemaphoreDelete(sock->rx_sem);
+        vSemaphoreDelete(sock->rx_exit_sem);
         free(sock);
         return NULL;
     }
-
-    sock->local_port = sock->pcb->local_port;
-
-    // Set receive callback
-    udp_recv(sock->pcb, udp_recv_callback, sock);
+    (void)xSemaphoreTake(sock->lwip_done, portMAX_DELAY);
+    if (lwip_op.result != ERR_OK) {
+        ESP_LOGE(TAG, "UDP PCB setup failed: %d", lwip_op.result);
+        vSemaphoreDelete(sock->lwip_done);
+        vSemaphoreDelete(sock->rx_sem);
+        vSemaphoreDelete(sock->rx_exit_sem);
+        free(sock);
+        return NULL;
+    }
 
     // Start dedicated RX task for consistent packet handling
     sock->rx_task_running = true;
@@ -330,10 +413,12 @@ ts_udp_socket_t *ts_udp_create(ts_t *ml, uint16_t local_port) {
 
         // 2. Also send CallMeMaybe to request peer initiate handshake
         // This covers the case where our handshake doesn't complete (NAT issues)
-        esp_err_t cmm_err = ts_disco_send_call_me_maybe(ml, peer_ip);
-        if (cmm_err == ESP_OK) {
-            ESP_LOGI(TAG, "  -> CallMeMaybe sent to peer %d (%s)",
-                     i, ts_vpn_ip_to_str(peer_ip, ip_buf));
+        if (ml->config.enable_disco) {
+            esp_err_t cmm_err = ts_disco_send_call_me_maybe(ml, peer_ip);
+            if (cmm_err == ESP_OK) {
+                ESP_LOGI(TAG, "  -> CallMeMaybe sent to peer %d (%s)",
+                         i, ts_vpn_ip_to_str(peer_ip, ip_buf));
+            }
         }
 
         // Small delay between peers to avoid overwhelming the network
@@ -353,18 +438,33 @@ void ts_udp_close(ts_udp_socket_t *sock) {
         if (sock->rx_sem) {
             xSemaphoreGive(sock->rx_sem);
         }
-        // Wait for task to exit
-        vTaskDelay(pdMS_TO_TICKS(150));
+        // The task exits after observing rx_task_running=false.
+        (void)xSemaphoreTake(sock->rx_exit_sem, portMAX_DELAY);
     }
 
     if (sock->pcb) {
-        udp_recv(sock->pcb, NULL, NULL);
-        udp_remove(sock->pcb);
+        udp_lwip_op_t lwip_op = {
+            .sock = sock,
+            .done = sock->lwip_done,
+            .result = ERR_IF,
+        };
+        /* The stack callback context remains valid while scheduling retries
+         * and until TCP/IP completes PCB removal. */
+        while (tcpip_callback(udp_close_callback, &lwip_op) != ERR_OK) {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        (void)xSemaphoreTake(sock->lwip_done, portMAX_DELAY);
         ESP_LOGI(TAG, "UDP socket closed (port=%u)", sock->local_port);
     }
 
     if (sock->rx_sem) {
         vSemaphoreDelete(sock->rx_sem);
+    }
+    if (sock->rx_exit_sem) {
+        vSemaphoreDelete(sock->rx_exit_sem);
+    }
+    if (sock->lwip_done) {
+        vSemaphoreDelete(sock->lwip_done);
     }
 
     free(sock);
@@ -407,19 +507,25 @@ esp_err_t ts_udp_send(ts_udp_socket_t *sock, uint32_t dest_ip,
     ip_addr_t dest_addr;
     ts_ip_to_lwip(dest_ip, &dest_addr);
 
-    // Allocate pbuf for the data
-    struct pbuf *p = pbuf_alloc(PBUF_TRANSPORT, len, PBUF_RAM);
-    if (!p) {
-        ESP_LOGE(TAG, "Failed to allocate pbuf");
+    if (!sock->lwip_done) {
         return ESP_ERR_NO_MEM;
     }
+    (void)xSemaphoreTake(sock->lwip_done, 0);
+    udp_send_op_t send_op = {
+        .sock = sock,
+        .done = sock->lwip_done,
+        .dest_addr = dest_addr,
+        .dest_port = dest_port,
+        .data = data,
+        .len = len,
+        .result = ERR_IF,
+    };
+    if (tcpip_callback(udp_send_callback, &send_op) != ERR_OK) {
+        return ESP_FAIL;
+    }
+    (void)xSemaphoreTake(sock->lwip_done, portMAX_DELAY);
 
-    // Copy data to pbuf
-    memcpy(p->payload, data, len);
-
-    // Send via lwIP UDP - routes through WireGuard netif for encryption
-    err_t err = udp_sendto(sock->pcb, p, &dest_addr, dest_port);
-    pbuf_free(p);
+    err_t err = send_op.result;
 
     if (err != ERR_OK) {
         // WireGuard send failed - decode the error
@@ -444,10 +550,12 @@ esp_err_t ts_udp_send(ts_udp_socket_t *sock, uint32_t dest_ip,
         }
 
         // Also send CallMeMaybe as backup to request peer initiate handshake
-        esp_err_t cmm_err = ts_disco_send_call_me_maybe(ml, dest_ip);
-        if (cmm_err == ESP_OK) {
-            ESP_LOGI(TAG, "CallMeMaybe also sent to %s",
-                     ts_vpn_ip_to_str(dest_ip, ip_buf));
+        if (ml->config.enable_disco) {
+            esp_err_t cmm_err = ts_disco_send_call_me_maybe(ml, dest_ip);
+            if (cmm_err == ESP_OK) {
+                ESP_LOGI(TAG, "CallMeMaybe also sent to %s",
+                         ts_vpn_ip_to_str(dest_ip, ip_buf));
+            }
         }
 
         return ESP_FAIL;
@@ -514,11 +622,6 @@ esp_err_t ts_udp_recv(ts_udp_socket_t *sock, uint32_t *src_ip,
         uint32_t elapsed = (xTaskGetTickCount() * portTICK_PERIOD_MS) - start_ms;
         if (timeout_ms > 0 && elapsed >= timeout_ms) {
             return ESP_ERR_TIMEOUT;
-        }
-
-        // Process Tailscale state machine while waiting (essential for DERP/WG)
-        if (sock->ml) {
-            ts_update(sock->ml);
         }
 
         // Brief delay

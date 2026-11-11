@@ -278,11 +278,6 @@ static esp_err_t disco_send_udp6(const uint8_t *ip6, uint16_t port, const uint8_
 /**
  * @brief Send UDP packet to endpoint (auto-detect IPv4/IPv6)
  */
-static esp_err_t disco_send_udp(uint32_t ip, uint16_t port, const uint8_t *data, size_t len) {
-    // Legacy IPv4-only function for backwards compatibility
-    return disco_send_udp4(ip, port, data, len);
-}
-
 /**
  * @brief Send UDP packet to endpoint structure (supports IPv4 and IPv6)
  */
@@ -1457,7 +1452,7 @@ bool ts_disco_is_disco_packet(const uint8_t *data, size_t len) {
  * The peer will receive this and attempt to connect to each endpoint listed.
  */
 esp_err_t ts_disco_send_call_me_maybe(ts_t *ml, uint32_t peer_vpn_ip) {
-    if (!ml || !ml->derp.connected) {
+    if (!ml || !ml->config.enable_disco || !ml->derp.connected) {
         return ESP_ERR_INVALID_STATE;
     }
 

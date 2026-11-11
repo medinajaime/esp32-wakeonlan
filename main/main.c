@@ -1,6 +1,6 @@
 /**
  * ESP32 Wake-on-LAN via Tailscale
- * Board : NodeMCU-32S / ESP32S  (no PSRAM)
+ * Tested board: ESP32-WROOM-32D dev kit (no PSRAM)
  * Port  : /dev/ttyUSB0
  *
  * The device joins your Tailscale network and listens on a
@@ -29,11 +29,48 @@
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "esp_heap_caps.h"
+#include "esp_timer.h"
 #include "nvs_flash.h"
 
 #include "ts.h"
 
 static const char *TAG = "wol";
+
+static uint32_t s_trigger_count;
+static uint32_t s_wol_success_count;
+static uint32_t s_wol_failure_count;
+static uint32_t s_ack_success_count;
+static uint32_t s_ack_failure_count;
+
+static void log_health(ts_t *ml)
+{
+    static uint64_t last_log_ms;
+    uint64_t now_ms = (uint64_t)esp_timer_get_time() / 1000;
+    if (now_ms - last_log_ms < 300000) {
+        return;
+    }
+    last_log_ms = now_ms;
+
+    ts_stats_t stats;
+    if (ts_get_stats(ml, &stats) != ESP_OK) {
+        memset(&stats, 0, sizeof(stats));
+    }
+    ESP_LOGI(TAG, "health up=%llus heap=%lu min=%lu largest8=%lu ts=%s derp=%s "
+             "trig=%lu wol=%lu/%lu ack=%lu/%lu drops=%lu wol_stack=%lu",
+             (unsigned long long)(now_ms / 1000),
+             (unsigned long)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned long)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+             ts_state_to_str(ts_get_state(ml)),
+             ts_is_derp_connected(ml) ? "up" : "down",
+             (unsigned long)s_trigger_count,
+             (unsigned long)s_wol_success_count,
+             (unsigned long)s_wol_failure_count,
+             (unsigned long)s_ack_success_count,
+             (unsigned long)s_ack_failure_count,
+             (unsigned long)stats.packets_dropped,
+             (unsigned long)uxTaskGetStackHighWaterMark(NULL));
+}
 
 /* ============================================================================
  * WiFi
@@ -236,6 +273,7 @@ static void wol_task(void *arg)
     bool prev_connected = true; /* already confirmed connected above */
 
     for (;;) {
+        log_health(ml);
         bool connected = ts_is_connected(ml);
 
         /*
@@ -287,13 +325,25 @@ static void wol_task(void *arg)
         esp_err_t err = ts_udp_recv(sock, &src_ip, &src_port,
                                            buf, &len, 500);
         if (err == ESP_OK) {
+            s_trigger_count++;
             char src_str[16];
             ESP_LOGI(TAG, "Trigger from %s:%d — firing WoL",
                      ts_vpn_ip_to_str(src_ip, src_str), src_port);
             if (wol_send_magic_packet(target_mac) == ESP_OK) {
+                s_wol_success_count++;
                 const char ack[] = "ok";
-                ts_udp_send(sock, src_ip, src_port, ack, sizeof(ack) - 1);
-                ESP_LOGI(TAG, "ACK sent to %s:%d", src_str, src_port);
+                esp_err_t ack_err = ts_udp_send(sock, src_ip, src_port,
+                                                ack, sizeof(ack) - 1);
+                if (ack_err == ESP_OK) {
+                    s_ack_success_count++;
+                    ESP_LOGI(TAG, "ACK submitted to %s:%d", src_str, src_port);
+                } else {
+                    s_ack_failure_count++;
+                    ESP_LOGW(TAG, "ACK submission failed to %s:%d: %s",
+                             src_str, src_port, esp_err_to_name(ack_err));
+                }
+            } else {
+                s_wol_failure_count++;
             }
 
         } else if (err == ESP_ERR_TIMEOUT) {
@@ -362,8 +412,9 @@ void app_main(void)
     cfg.auth_key            = CONFIG_WOL_TAILSCALE_AUTH_KEY;
     cfg.device_name         = CONFIG_WOL_DEVICE_NAME;
     cfg.enable_derp         = true;   /* Required for remote NAT traversal */
-    cfg.enable_disco        = true;
-    cfg.enable_stun         = true;
+    /* This gateway needs reliable DERP reception, not direct-path probing. */
+    cfg.enable_disco        = false;
+    cfg.enable_stun         = false;
     cfg.max_peers           = 4;      /* Low value saves SRAM */
     cfg.on_connected        = on_connected;
     cfg.on_disconnected     = on_disconnected;

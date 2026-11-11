@@ -105,27 +105,16 @@ typedef struct {
  * ========================================================================== */
 
 /**
- * @brief Log hex bytes for debugging crypto operations
- * NOTE: Using %u instead of %zu because nano printf doesn't support %zu
+ * @brief Security: prevent sensitive binary data from appearing in logs
  */
-static void log_hex(const char *label, const uint8_t *data, size_t len) {
-    if (!data || !label || len == 0) {
-        ESP_LOGW(TAG, "log_hex: invalid params (label=%p, data=%p, len=%u)",
-                 (void *)label, (void *)data, (unsigned int)len);
-        return;
-    }
-    char hex[128];
-    size_t hex_len = (len > 32) ? 32 : len;  // Show first 32 bytes max
-    for (size_t i = 0; i < hex_len; i++) {
-        sprintf(hex + i * 2, "%02x", data[i]);
-    }
-    hex[hex_len * 2] = '\0';
-    if (len > 32) {
-        ESP_LOGI(TAG, "%s (%u bytes): %s...", label, (unsigned int)len, hex);
-    } else {
-        ESP_LOGI(TAG, "%s (%u bytes): %s", label, (unsigned int)len, hex);
-    }
+
+static void log_hex(const char *label, const uint8_t *data, size_t len)
+{
+    (void)label;
+    (void)data;
+    (void)len;
 }
+
 
 /**
  * @brief BLAKE2s-256 hash
@@ -233,19 +222,15 @@ static void noise_hkdf(uint8_t *out1, uint8_t *out2, uint8_t *out3,
  * @brief Update handshake hash: h = BLAKE2s(h || data)
  */
 static void noise_mix_hash(noise_state_t *noise, const uint8_t *data, size_t len) {
-    // Allocate combined buffer dynamically to avoid stack overflow
-    size_t combined_len = NOISE_HASH_LEN + len;
-    uint8_t *combined = malloc(combined_len);
-    if (!combined) {
-        ESP_LOGE(TAG, "Failed to allocate buffer for noise_mix_hash");
-        return;
+    // Hash the two segments directly. No heap allocation or silent OOM failure
+    // is possible during an authenticated Noise handshake.
+    blake2s_ctx state;
+    blake2s_init(&state, NOISE_HASH_LEN, NULL, 0);
+    blake2s_update(&state, noise->h, NOISE_HASH_LEN);
+    if (len > 0) {
+        blake2s_update(&state, data, len);
     }
-
-    memcpy(combined, noise->h, NOISE_HASH_LEN);
-    memcpy(combined + NOISE_HASH_LEN, data, len);
-    noise_hash(noise->h, combined, combined_len);
-
-    free(combined);
+    blake2s_final(&state, noise->h);
 }
 
 /**
@@ -306,6 +291,10 @@ static esp_err_t noise_decrypt(const uint8_t *key, uint64_t nonce,
                                const uint8_t *ad, size_t ad_len,
                                const uint8_t *ciphertext, size_t ciphertext_len,
                                uint8_t *plaintext) {
+    if (!key || !ciphertext || !plaintext || ciphertext_len < NOISE_MAC_LEN) {
+        return ESP_ERR_INVALID_SIZE;
+    }
+
     // Convert nonce to Tailscale's big-endian format
     uint64_t ts_nonce = nonce_to_tailscale_format(nonce);
 
@@ -688,7 +677,7 @@ static esp_err_t fetch_server_public_key(uint8_t *out_key) {
     }
     response_buf[read_len] = '\0';
 
-    ESP_LOGD(TAG, "Key response: %s", response_buf);
+    ESP_LOGD(TAG, "Received control-server key response (%d bytes)", read_len);
 
     // Parse JSON to extract publicKey
     // Format: {"publicKey":"mkey:7d2792f9c98d753d...","legacyPublicKey":"..."}
@@ -792,62 +781,61 @@ static const uint8_t *get_server_public_key(void) {
  */
 static esp_err_t load_or_generate_machine_key(ts_t *ml) {
     nvs_handle_t nvs;
-    esp_err_t ret;
-    bool need_save = false;
-
-    // Open NVS namespace
-    ret = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
+    esp_err_t ret = nvs_open(NVS_NAMESPACE, NVS_READWRITE, &nvs);
     if (ret != ESP_OK) {
-        ESP_LOGW(TAG, "Failed to open NVS, will generate ephemeral key: %d", ret);
-        goto generate_new;
+        ESP_LOGE(TAG, "Cannot open NVS for machine identity: %s", esp_err_to_name(ret));
+        return ret;  // Do not silently rotate identity on storage errors.
     }
 
-    // Try to load private key
+    bool need_save = false;
     size_t key_len = 32;
     ret = nvs_get_blob(nvs, NVS_KEY_MACHINE_PRI, ml->coordination.machine_private_key, &key_len);
     if (ret == ESP_OK && key_len == 32) {
-        // Load public key
-        key_len = 32;
-        ret = nvs_get_blob(nvs, NVS_KEY_MACHINE_PUB, ml->coordination.machine_public_key, &key_len);
-        if (ret == ESP_OK && key_len == 32) {
-            ESP_LOGI(TAG, "Loaded existing machine key from NVS");
+        // Always derive the public key from the persisted private key.
+        // This also repairs a missing/stale public-key entry.
+        x25519_base(ml->coordination.machine_public_key,
+                    ml->coordination.machine_private_key, 1);
+        uint8_t stored_public[32];
+        size_t pub_len = sizeof(stored_public);
+        esp_err_t pub_ret = nvs_get_blob(nvs, NVS_KEY_MACHINE_PUB,
+                                          stored_public, &pub_len);
+        if (pub_ret == ESP_OK && pub_len == sizeof(stored_public)) {
+            need_save = memcmp(stored_public, ml->coordination.machine_public_key,
+                               sizeof(stored_public)) != 0;
+        } else if (pub_ret == ESP_ERR_NVS_NOT_FOUND) {
+            need_save = true;
+        } else {
             nvs_close(nvs);
-            return ESP_OK;
+            return pub_ret == ESP_OK ? ESP_ERR_INVALID_SIZE : pub_ret;
         }
+        ESP_LOGI(TAG, "Loaded existing machine identity from NVS");
+    } else if (ret == ESP_ERR_NVS_NOT_FOUND) {
+        ESP_LOGI(TAG, "Machine identity absent; generating a persistent key");
+        esp_fill_random(ml->coordination.machine_private_key, 32);
+        ml->coordination.machine_private_key[0] &= 248;
+        ml->coordination.machine_private_key[31] &= 127;
+        ml->coordination.machine_private_key[31] |= 64;
+        x25519_base(ml->coordination.machine_public_key,
+                    ml->coordination.machine_private_key, 1);
+        need_save = true;
+    } else {
+        ESP_LOGE(TAG, "Unable to read machine identity from NVS: %s", esp_err_to_name(ret));
+        nvs_close(nvs);
+        return ret == ESP_OK ? ESP_ERR_INVALID_SIZE : ret;
     }
 
-    ESP_LOGI(TAG, "No machine key in NVS, generating new one");
-    need_save = true;
-
-generate_new:
-    // Generate new machine key (Curve25519 keypair)
-    {
-        noise_state_t temp_noise;
-        noise_init(&temp_noise, NULL, get_server_public_key(), TAILSCALE_PROTOCOL_VERSION);
-
-        // Store machine keys
-        memcpy(ml->coordination.machine_private_key, temp_noise.local_static_private, 32);
-        memcpy(ml->coordination.machine_public_key, temp_noise.local_static_public, 32);
-    }
-
-    // Save to NVS if we opened it successfully
-    if (need_save && nvs != 0) {
+    if (need_save) {
         ret = nvs_set_blob(nvs, NVS_KEY_MACHINE_PRI, ml->coordination.machine_private_key, 32);
         if (ret == ESP_OK) {
             ret = nvs_set_blob(nvs, NVS_KEY_MACHINE_PUB, ml->coordination.machine_public_key, 32);
         }
-        if (ret == ESP_OK) {
-            ret = nvs_commit(nvs);
-        }
-        if (ret == ESP_OK) {
-            ESP_LOGI(TAG, "Saved new machine key to NVS");
-        } else {
-            ESP_LOGW(TAG, "Failed to save machine key to NVS: %d", ret);
-        }
-        nvs_close(nvs);
+        if (ret == ESP_OK) ret = nvs_commit(nvs);
     }
-
-    return ESP_OK;
+    nvs_close(nvs);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Could not persist machine identity: %s", esp_err_to_name(ret));
+    }
+    return ret;
 }
 
 esp_err_t ts_coordination_init(ts_t *ml) {
@@ -884,8 +872,15 @@ esp_err_t ts_coordination_init(ts_t *ml) {
     ml->coordination.connection_error = false;
     ml->coordination.frames_processed = 0;
 
-    // Load or generate machine key (persisted in NVS)
-    load_or_generate_machine_key(ml);
+    // Do not proceed with an ephemeral machine identity after an NVS failure.
+    esp_err_t key_ret = load_or_generate_machine_key(ml);
+    if (key_ret != ESP_OK) {
+        heap_caps_free(ml->coordination.psram_buffer);
+        ml->coordination.psram_buffer = NULL;
+        vSemaphoreDelete(ml->coordination.mutex);
+        ml->coordination.mutex = NULL;
+        return key_ret;
+    }
 
     // Create machine key string (base64-encoded public key with "mkey:" prefix)
     // For now, use hex representation
@@ -960,7 +955,8 @@ esp_err_t ts_coordination_register(ts_t *ml) {
     // Allocate buffers
     msg1 = malloc(1024);
     msg2 = malloc(2048);
-    response_payload = malloc(1024);
+    // Message2 payload may approach the full 2048-byte Noise frame cap.
+    response_payload = malloc(2048);
     payload = malloc(512);
 
     if (!msg1 || !msg2 || !response_payload || !payload) {
@@ -993,7 +989,7 @@ esp_err_t ts_coordination_register(ts_t *ml) {
     size_t msg1_len = noise_write_message_1(&noise, TAILSCALE_PROTOCOL_VERSION, msg1);
 
     ESP_LOGI(TAG, "Generated Noise message 1: %u bytes (should be 101)", (unsigned int)msg1_len);
-    ESP_LOGI(TAG, "Registration payload will be sent after handshake: %s", payload);
+    ESP_LOGI(TAG, "Registration payload prepared");
 
     // Step 1: Establish plain TCP connection to port 80 (HTTP mode - happy path)
     // Tailscale uses HTTP on port 80 as the primary protocol, with HTTPS on 443 as fallback
@@ -1054,6 +1050,7 @@ esp_err_t ts_coordination_register(ts_t *ml) {
     if (err != 0) {
         ESP_LOGE(TAG, "Socket connect failed: %d", errno);
         close(sock);
+        sock = -1;
         ret = ESP_FAIL;
         goto cleanup;
     }
@@ -1068,6 +1065,7 @@ esp_err_t ts_coordination_register(ts_t *ml) {
     if (!msg1_b64) {
         ESP_LOGE(TAG, "Failed to allocate base64 buffer");
         close(sock);
+        sock = -1;
         ret = ESP_ERR_NO_MEM;
         goto cleanup;
     }
@@ -1078,6 +1076,7 @@ esp_err_t ts_coordination_register(ts_t *ml) {
         ESP_LOGE(TAG, "Failed to base64 encode: %d", ret);
         free(msg1_b64);
         close(sock);
+        sock = -1;
         ret = ESP_FAIL;
         goto cleanup;
     }
@@ -1092,6 +1091,7 @@ esp_err_t ts_coordination_register(ts_t *ml) {
         ESP_LOGE(TAG, "Failed to allocate HTTP request buffer");
         free(msg1_b64);
         close(sock);
+        sock = -1;
         ret = ESP_ERR_NO_MEM;
         goto cleanup;
     }
@@ -1119,6 +1119,7 @@ esp_err_t ts_coordination_register(ts_t *ml) {
     if (written < request_len) {
         ESP_LOGE(TAG, "Failed to send HTTP request: %d (errno: %d)", written, errno);
         close(sock);
+        sock = -1;
         ret = ESP_FAIL;
         goto cleanup;
     }
@@ -1127,10 +1128,11 @@ esp_err_t ts_coordination_register(ts_t *ml) {
 
     // Step 4: Read HTTP 101 response
     // Allocate larger buffer in case Noise message 2 comes with HTTP 101
-    char *http_response = (char *)malloc(2048);
+    char *http_response = (char *)malloc(2049);
     if (!http_response) {
         ESP_LOGE(TAG, "Failed to allocate HTTP response buffer");
         close(sock);
+        sock = -1;
         ret = ESP_ERR_NO_MEM;
         goto cleanup;
     }
@@ -1141,15 +1143,15 @@ esp_err_t ts_coordination_register(ts_t *ml) {
         ESP_LOGE(TAG, "Failed to read HTTP response: %d (errno: %d)", read_len, errno);
         free(http_response);
         close(sock);
+        sock = -1;
         ret = ESP_FAIL;
         goto cleanup;
     }
 
     ESP_LOGI(TAG, "Received HTTP response (%d bytes total)", read_len);
-    ESP_LOG_BUFFER_HEX_LEVEL(TAG, http_response, read_len < 128 ? read_len : 128, ESP_LOG_INFO);
 
     // Null-terminate for string operations (but data may continue as binary)
-    http_response[read_len < 2047 ? read_len : 2047] = '\0';
+    http_response[read_len] = '\0';
 
     // Declare msg2_len early so it can be used throughout
     int msg2_len = 0;
@@ -1158,7 +1160,7 @@ esp_err_t ts_coordination_register(ts_t *ml) {
     char *headers_end = strstr(http_response, "\r\n\r\n");
     if (headers_end) {
         *headers_end = '\0';  // Temporarily terminate at end of headers
-        ESP_LOGI(TAG, "HTTP headers:\n%s", http_response);
+        ESP_LOGI(TAG, "HTTP upgrade response headers received");
 
         // Check for X-Tailscale-Response header (Noise message 2 might be here)
         char *response_header = strstr(http_response, "X-Tailscale-Response:");
@@ -1169,6 +1171,12 @@ esp_err_t ts_coordination_register(ts_t *ml) {
             if (response_end) {
                 size_t response_b64_len = response_end - response_header;
                 char *response_b64 = strndup(response_header, response_b64_len);
+                if (!response_b64) {
+                    ESP_LOGE(TAG, "Failed to allocate encoded handshake header");
+                    free(http_response);
+                    ret = ESP_ERR_NO_MEM;
+                    goto cleanup;
+                }
 
                 ESP_LOGI(TAG, "Found X-Tailscale-Response header (%u bytes base64)", (unsigned int)response_b64_len);
 
@@ -1181,7 +1189,6 @@ esp_err_t ts_coordination_register(ts_t *ml) {
                 if (ret == 0) {
                     msg2_len = decoded_len;
                     ESP_LOGI(TAG, "Decoded Noise message 2 from header: %d bytes", msg2_len);
-                    ESP_LOG_BUFFER_HEX_LEVEL(TAG, msg2, msg2_len < 64 ? msg2_len : 64, ESP_LOG_INFO);
                 } else {
                     ESP_LOGW(TAG, "Failed to base64 decode X-Tailscale-Response: %d", ret);
                 }
@@ -1190,7 +1197,7 @@ esp_err_t ts_coordination_register(ts_t *ml) {
 
         *headers_end = '\r';  // Restore for later parsing
     } else {
-        ESP_LOGI(TAG, "HTTP headers:\n%s", http_response);
+        ESP_LOGI(TAG, "HTTP upgrade response headers received");
     }
 
     // Parse HTTP status line
@@ -1199,6 +1206,7 @@ esp_err_t ts_coordination_register(ts_t *ml) {
         ESP_LOGE(TAG, "Failed to parse HTTP status");
         free(http_response);
         close(sock);
+        sock = -1;
         ret = ESP_FAIL;
         goto cleanup;
     }
@@ -1210,18 +1218,25 @@ esp_err_t ts_coordination_register(ts_t *ml) {
         char *body_start = strstr(http_response, "\r\n\r\n");
         if (body_start) {
             body_start += 4;
-            ESP_LOGE(TAG, "Server error (HTTP %d): %s", status_code, body_start);
+            ESP_LOGE(TAG, "Control server rejected HTTP upgrade (status %d)", status_code);
         } else {
             ESP_LOGE(TAG, "Expected HTTP 101, got %d", status_code);
         }
         free(http_response);
         close(sock);
+        sock = -1;
         ret = ESP_FAIL;
         goto cleanup;
     }
 
     // Find any data after HTTP headers (check if already in the initial read)
     char *body_start = strstr(http_response, "\r\n\r\n");
+    if (!body_start) {
+        ESP_LOGE(TAG, "Incomplete HTTP upgrade headers");
+        free(http_response);
+        ret = ESP_ERR_INVALID_RESPONSE;
+        goto cleanup;
+    }
 
     if (body_start && msg2_len == 0) {  // Only check body if we didn't get it from header
         body_start += 4;  // Skip past \r\n\r\n
@@ -1230,7 +1245,6 @@ esp_err_t ts_coordination_register(ts_t *ml) {
         if (msg2_len > 0) {
             ESP_LOGI(TAG, "Found %d bytes after HTTP headers", msg2_len);
             memcpy(msg2, body_start, msg2_len);
-            ESP_LOG_BUFFER_HEX_LEVEL(TAG, msg2, msg2_len < 64 ? msg2_len : 64, ESP_LOG_INFO);
         }
     }
 
@@ -1254,8 +1268,13 @@ esp_err_t ts_coordination_register(ts_t *ml) {
 
         ESP_LOGI(TAG, "Buffered Noise frame: type=0x%02x, length=%d", msg_type, frame_payload_len);
 
-        if (msg_type != 0x02) {
-            ESP_LOGW(TAG, "Unexpected Noise message type: 0x%02x (expected 0x02)", msg_type);
+        // Validate untrusted frame length before recv().
+        if (msg_type != 0x02 ||
+            frame_payload_len < NOISE_MAC_LEN ||
+            (size_t)frame_payload_len + 3U > 2048U) {
+            ESP_LOGE(TAG, "Invalid Noise handshake frame");
+            ret = ESP_ERR_INVALID_SIZE;
+            goto cleanup;
         }
 
         // Check if we have the complete message
@@ -1284,8 +1303,6 @@ esp_err_t ts_coordination_register(ts_t *ml) {
             int extra_data_offset = total_expected;  // Save offset to extra data
             if (extra_data_len > 0) {
                 ESP_LOGI(TAG, "Found %d extra bytes after Noise message 2:", extra_data_len);
-                ESP_LOG_BUFFER_HEX_LEVEL(TAG, msg2 + total_expected,
-                                         extra_data_len < 64 ? extra_data_len : 64, ESP_LOG_INFO);
             }
 
             // Save the extra data before moving msg2 payload
@@ -1301,7 +1318,6 @@ esp_err_t ts_coordination_register(ts_t *ml) {
             memmove(msg2, msg2 + 3, frame_payload_len);
             msg2_len = frame_payload_len;
             ESP_LOGI(TAG, "Complete Noise message 2 payload: %d bytes", msg2_len);
-            ESP_LOG_BUFFER_HEX_LEVEL(TAG, msg2, msg2_len < 64 ? msg2_len : 64, ESP_LOG_INFO);
 
             // Count how many transport frames are in the extra data
             // These are frames the server sent proactively after handshake
@@ -1343,6 +1359,7 @@ esp_err_t ts_coordination_register(ts_t *ml) {
         } else {
             ESP_LOGE(TAG, "Failed to get complete Noise message 2 (have %d/%d)", msg2_len, total_expected);
             close(sock);
+            sock = -1;
             ret = ESP_FAIL;
             goto cleanup;
         }
@@ -1376,25 +1393,28 @@ esp_err_t ts_coordination_register(ts_t *ml) {
         if (header_read != 3) {
             ESP_LOGE(TAG, "Failed to read complete Noise frame header (got %d/3 bytes)", header_read);
             close(sock);
+            sock = -1;
             ret = ESP_FAIL;
             goto cleanup;
         }
 
-        // Verify message type (should be 0x02 for Noise response)
-        if (frame_header[0] != 0x02) {
-            ESP_LOGW(TAG, "Unexpected Noise message type: 0x%02x (expected 0x02)", frame_header[0]);
-        }
 
-        // Get frame payload length (big-endian uint16)
-        uint16_t frame_payload_len = (frame_header[1] << 8) | frame_header[2];
-        ESP_LOGI(TAG, "Noise message 2 payload length: %d bytes", frame_payload_len);
+        // Read the payload length from the 3-byte frame header.
+        uint16_t frame_payload_len =
+            ((uint16_t)frame_header[1] << 8) | frame_header[2];
 
-        if (frame_payload_len > 2048) {
-            ESP_LOGE(TAG, "Payload too large: %d bytes", frame_payload_len);
-            close(sock);
-            ret = ESP_FAIL;
+        // Reject unexpected types and invalid payload lengths.
+        if (frame_header[0] != 0x02 ||
+            frame_payload_len < NOISE_MAC_LEN ||
+            frame_payload_len > 2048U) {
+            ESP_LOGE(TAG, "Invalid Noise handshake frame");
+            ret = ESP_ERR_INVALID_SIZE;
             goto cleanup;
         }
+
+        ESP_LOGI(TAG, "Noise message 2 payload length: %u bytes",
+                 (unsigned int)frame_payload_len);
+
 
         // Read the payload from raw socket
         msg2_len = 0;
@@ -1404,7 +1424,6 @@ esp_err_t ts_coordination_register(ts_t *ml) {
                 msg2_len += n;
                 if (msg2_len == frame_payload_len) {
                     ESP_LOGI(TAG, "Read complete Noise message 2 payload: %d bytes", msg2_len);
-                    ESP_LOG_BUFFER_HEX_LEVEL(TAG, msg2, msg2_len < 64 ? msg2_len : 64, ESP_LOG_INFO);
                     break;
                 }
             } else if (n < 0) {
@@ -1418,6 +1437,7 @@ esp_err_t ts_coordination_register(ts_t *ml) {
         if (msg2_len != frame_payload_len) {
             ESP_LOGE(TAG, "Failed to read complete payload (got %d/%d bytes)", msg2_len, frame_payload_len);
             close(sock);
+            sock = -1;
             ret = ESP_FAIL;
             goto cleanup;
         }
@@ -1562,7 +1582,7 @@ esp_err_t ts_coordination_register(ts_t *ml) {
                                 cJSON *challenge = cJSON_GetObjectItem(early_json, "nodeKeyChallenge");
                                 if (challenge && cJSON_IsString(challenge)) {
                                     const char *chal_str = challenge->valuestring;
-                                    ESP_LOGI(TAG, "  *** Found nodeKeyChallenge: %.40s... ***", chal_str);
+                                    ESP_LOGI(TAG, "Node key challenge received");
 
                                     // Parse "chalpub:hex..." format (64 hex chars = 32 bytes)
                                     if (strncmp(chal_str, "chalpub:", 8) == 0) {
@@ -1610,7 +1630,8 @@ esp_err_t ts_coordination_register(ts_t *ml) {
                                      h2_type, (unsigned long)h2_len, h2_flags);
 
                             // Type 4 = SETTINGS, Type 7 = GOAWAY, Type 6 = PING
-                            if (h2_type == 4 && h2_len > 0) {
+                            if (h2_type == 4 && h2_len > 0 &&
+                                h2_len <= plaintext_len - 9) {
                                 ESP_LOGI(TAG, "  -> Server SETTINGS frame with %lu bytes", (unsigned long)h2_len);
                                 // Parse SETTINGS payload (starts at byte 9 of HTTP/2 frame)
                                 const uint8_t *settings = plaintext + 9;
@@ -1630,8 +1651,10 @@ esp_err_t ts_coordination_register(ts_t *ml) {
                                     }
                                     ESP_LOGI(TAG, "    SETTING %s (0x%x) = %lu", name, id, (unsigned long)val);
                                 }
-                            } else if (h2_type == 4) {
+                            } else if (h2_type == 4 && h2_len == 0) {
                                 ESP_LOGI(TAG, "  -> Server SETTINGS ACK");
+                            } else if (h2_type == 4) {
+                                ESP_LOGW(TAG, "  -> Incomplete server SETTINGS payload");
                             } else if (h2_type == 7) {
                                 ESP_LOGW(TAG, "  -> Server GOAWAY frame!");
                             }
@@ -1713,6 +1736,7 @@ esp_err_t ts_coordination_register(ts_t *ml) {
     if (!h2_init) {
         ESP_LOGE(TAG, "Failed to allocate HTTP/2 init buffer");
         close(sock);
+        sock = -1;
         ret = ESP_ERR_NO_MEM;
         goto cleanup;
     }
@@ -1730,6 +1754,7 @@ esp_err_t ts_coordination_register(ts_t *ml) {
         free(h2_init);
         ESP_LOGE(TAG, "Failed to allocate encrypted buffer");
         close(sock);
+        sock = -1;
         ret = ESP_ERR_NO_MEM;
         goto cleanup;
     }
@@ -1740,7 +1765,6 @@ esp_err_t ts_coordination_register(ts_t *ml) {
     encrypted_payload[2] = encrypted_len & 0xFF;
 
     ESP_LOGI(TAG, "Encrypting HTTP/2 preface with tx_nonce=%lu", (unsigned long)noise.tx_nonce);
-    log_hex("tx_key for encryption", noise.tx_key, 32);
 
     ret = noise_encrypt(noise.tx_key, noise.tx_nonce++,
                        NULL, 0,
@@ -1755,6 +1779,7 @@ esp_err_t ts_coordination_register(ts_t *ml) {
         ESP_LOGE(TAG, "Failed to encrypt HTTP/2 preface");
         free(encrypted_payload);
         close(sock);
+        sock = -1;
         goto cleanup;
     }
 
@@ -1767,6 +1792,7 @@ esp_err_t ts_coordination_register(ts_t *ml) {
     if (sent != total_send_len) {
         ESP_LOGE(TAG, "Failed to send HTTP/2 preface: %d (errno: %d)", sent, errno);
         close(sock);
+        sock = -1;
         ret = ESP_FAIL;
         goto cleanup;
     }
@@ -1944,7 +1970,7 @@ esp_err_t ts_coordination_register(ts_t *ml) {
         char chalresp_str[80];
         snprintf(chalresp_str, sizeof(chalresp_str), "chalresp:%s", chalresp_hex);
         cJSON_AddStringToObject(reg_req, "NodeKeyChallengeResponse", chalresp_str);
-        ESP_LOGI(TAG, "Added NodeKeyChallengeResponse: %.40s...", chalresp_str);
+        ESP_LOGI(TAG, "Node key challenge response prepared");
     } else {
         ESP_LOGW(TAG, "No nodeKeyChallenge received - registration may fail!");
     }
@@ -1963,13 +1989,14 @@ esp_err_t ts_coordination_register(ts_t *ml) {
     if (!reg_req_str) {
         ESP_LOGE(TAG, "Failed to serialize RegisterRequest");
         close(sock);
+        sock = -1;
         ret = ESP_FAIL;
         goto cleanup;
     }
 
     size_t json_payload_len = strlen(reg_req_str);
-    ESP_LOGI(TAG, "RegisterRequest payload (%u bytes): %.200s%s",
-             (unsigned int)json_payload_len, reg_req_str, json_payload_len > 200 ? "..." : "");
+    ESP_LOGI(TAG, "RegisterRequest prepared (%u bytes)",
+             (unsigned int)json_payload_len);
 
     // Build HTTP/2 HEADERS frame (simplified - no HPACK compression)
     // Frame format: 9-byte header + payload
@@ -2046,6 +2073,7 @@ esp_err_t ts_coordination_register(ts_t *ml) {
         ESP_LOGE(TAG, "Failed to allocate DATA frame");
         free(reg_req_str);
         close(sock);
+        sock = -1;
         ret = ESP_ERR_NO_MEM;
         goto cleanup;
     }
@@ -2071,6 +2099,7 @@ esp_err_t ts_coordination_register(ts_t *ml) {
         free(h2_data_frame);
         ESP_LOGE(TAG, "Failed to allocate combined H2 buffer");
         close(sock);
+        sock = -1;
         ret = ESP_ERR_NO_MEM;
         goto cleanup;
     }
@@ -2089,6 +2118,7 @@ esp_err_t ts_coordination_register(ts_t *ml) {
         free(h2_combined);
         ESP_LOGE(TAG, "Failed to allocate encryption buffer");
         close(sock);
+        sock = -1;
         ret = ESP_ERR_NO_MEM;
         goto cleanup;
     }
@@ -2109,6 +2139,7 @@ esp_err_t ts_coordination_register(ts_t *ml) {
         free(enc_buf);
         ESP_LOGE(TAG, "Failed to encrypt RegisterRequest");
         close(sock);
+        sock = -1;
         goto cleanup;
     }
 
@@ -2121,6 +2152,7 @@ esp_err_t ts_coordination_register(ts_t *ml) {
     if (sent != send_len) {
         ESP_LOGE(TAG, "Failed to send RegisterRequest: %d (errno: %d)", sent, errno);
         close(sock);
+        sock = -1;
         ret = ESP_FAIL;
         goto cleanup;
     }
@@ -2137,6 +2169,7 @@ esp_err_t ts_coordination_register(ts_t *ml) {
     if (!h2_buffer) {
         ESP_LOGE(TAG, "Failed to allocate H2 buffer");
         close(sock);
+        sock = -1;
         ret = ESP_ERR_NO_MEM;
         goto cleanup;
     }
@@ -2166,6 +2199,7 @@ esp_err_t ts_coordination_register(ts_t *ml) {
                 ESP_LOGE(TAG, "Failed to read first response header (got %d/3)", header_read);
                 free(h2_buffer);
                 close(sock);
+                sock = -1;
                 ret = ESP_FAIL;
                 goto cleanup;
             }
@@ -2185,10 +2219,14 @@ esp_err_t ts_coordination_register(ts_t *ml) {
             ESP_LOGW(TAG, "Unexpected response type 0x%02x (expected 0x04 Data)", resp_type);
         }
 
-        if (resp_payload_len > 4096) {
-            ESP_LOGE(TAG, "Response frame too large: %u bytes", resp_payload_len);
+        if (resp_type != 0x04 ||
+            resp_payload_len < NOISE_MAC_LEN ||
+            resp_payload_len > 4096) {
+            ESP_LOGE(TAG, "Invalid encrypted registration response frame (type=0x%02x, len=%u)",
+                     resp_type, resp_payload_len);
             free(h2_buffer);
             close(sock);
+            sock = -1;
             ret = ESP_FAIL;
             goto cleanup;
         }
@@ -2199,6 +2237,7 @@ esp_err_t ts_coordination_register(ts_t *ml) {
             ESP_LOGE(TAG, "Failed to allocate response buffer");
             free(h2_buffer);
             close(sock);
+            sock = -1;
             ret = ESP_ERR_NO_MEM;
             goto cleanup;
         }
@@ -2221,17 +2260,19 @@ esp_err_t ts_coordination_register(ts_t *ml) {
             free(resp_encrypted);
             free(h2_buffer);
             close(sock);
+            sock = -1;
             ret = ESP_FAIL;
             goto cleanup;
         }
 
         // Decrypt this frame
         size_t decrypted_len = resp_payload_len - NOISE_MAC_LEN;
-        uint8_t *decrypted_frame = malloc(decrypted_len);
+        uint8_t *decrypted_frame = malloc(decrypted_len > 0 ? decrypted_len : 1U);
         if (!decrypted_frame) {
             free(resp_encrypted);
             free(h2_buffer);
             close(sock);
+            sock = -1;
             ret = ESP_ERR_NO_MEM;
             goto cleanup;
         }
@@ -2248,6 +2289,7 @@ esp_err_t ts_coordination_register(ts_t *ml) {
             free(decrypted_frame);
             free(h2_buffer);
             close(sock);
+            sock = -1;
             ret = ESP_FAIL;
             goto cleanup;
         }
@@ -2343,6 +2385,7 @@ esp_err_t ts_coordination_register(ts_t *ml) {
         ESP_LOGW(TAG, "No JSON data found in response");
         free(h2_buffer);
         close(sock);
+        sock = -1;
         ret = ESP_OK;  // Not an error, just no data yet
         goto cleanup;
     }
@@ -2352,14 +2395,15 @@ esp_err_t ts_coordination_register(ts_t *ml) {
     if (!json_copy) {
         free(h2_buffer);
         close(sock);
+        sock = -1;
         ret = ESP_ERR_NO_MEM;
         goto cleanup;
     }
     memcpy(json_copy, json_data, json_len);
     json_copy[json_len] = '\0';
 
-    ESP_LOGI(TAG, "Parsing JSON (%u bytes): %.200s%s",
-             (unsigned int)json_len, (char *)json_copy, json_len > 200 ? "..." : "");
+    ESP_LOGI(TAG, "Registration response received (%u bytes)",
+         (unsigned int)json_len);
 
     // Parse JSON response (Tailscale RegisterResponse)
     // RegisterResponse contains: User, Login, MachineAuthorized, AuthURL, Error, etc.
@@ -2369,22 +2413,24 @@ esp_err_t ts_coordination_register(ts_t *ml) {
     if (!root) {
         ESP_LOGE(TAG, "Failed to parse JSON response");
         free(h2_buffer);
+        ret = ESP_ERR_INVALID_RESPONSE;
         goto cleanup;
     }
 
     // Check for error in registration response
     cJSON *error = cJSON_GetObjectItem(root, "Error");
     if (error && cJSON_IsString(error) && strlen(error->valuestring) > 0) {
-        ESP_LOGE(TAG, "Registration error: %s", error->valuestring);
+        ESP_LOGE(TAG, "Control server reported a registration error (details redacted)");
         cJSON_Delete(root);
         free(h2_buffer);
+        ret = ESP_FAIL;
         goto cleanup;
     }
 
     // Check if machine needs authorization
     cJSON *auth_url = cJSON_GetObjectItem(root, "AuthURL");
     if (auth_url && cJSON_IsString(auth_url) && strlen(auth_url->valuestring) > 0) {
-        ESP_LOGW(TAG, "Device needs authorization! Visit: %s", auth_url->valuestring);
+        ESP_LOGW(TAG, "Device authorization required; check Tailscale admin console");
         // For pre-auth keys, this shouldn't happen
     }
 
@@ -2400,7 +2446,7 @@ esp_err_t ts_coordination_register(ts_t *ml) {
     if (user) {
         cJSON *display_name = cJSON_GetObjectItem(user, "DisplayName");
         if (display_name && cJSON_IsString(display_name)) {
-            ESP_LOGI(TAG, "Registered as user: %s", display_name->valuestring);
+            ESP_LOGD(TAG, "Registration user display name received");
         }
         cJSON *user_id = cJSON_GetObjectItem(user, "ID");
         if (user_id && cJSON_IsNumber(user_id)) {
@@ -2413,7 +2459,7 @@ esp_err_t ts_coordination_register(ts_t *ml) {
     if (login) {
         cJSON *login_name = cJSON_GetObjectItem(login, "LoginName");
         if (login_name && cJSON_IsString(login_name)) {
-            ESP_LOGI(TAG, "Login: %s", login_name->valuestring);
+            ESP_LOGD(TAG, "Registration login name received");
         }
     }
 
@@ -2472,55 +2518,9 @@ esp_err_t ts_coordination_fetch_peers(ts_t *ml) {
     int sock = ml->coordination.socket;
     esp_err_t ret = ESP_FAIL;
 
-    // Check for any pending data from server (might be GOAWAY or other frames)
-    uint8_t peek_buf[256];
-    struct timeval peek_tv = { .tv_sec = 0, .tv_usec = 100000 };  // 100ms
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &peek_tv, sizeof(peek_tv));
-    int peek_len = recv(sock, peek_buf, sizeof(peek_buf), MSG_PEEK);
-    if (peek_len > 0) {
-        ESP_LOGW(TAG, "Server has %d pending bytes before MapRequest!", peek_len);
-        ESP_LOGW(TAG, "Pending data: %02x %02x %02x %02x %02x %02x %02x %02x",
-                 peek_buf[0], peek_buf[1], peek_buf[2], peek_buf[3],
-                 peek_buf[4], peek_buf[5], peek_buf[6], peek_buf[7]);
-
-        // Drain and process the pending data - it might contain important frames
-        recv(sock, peek_buf, peek_len, 0);
-
-        // Check if it's a Noise transport frame (type 0x04)
-        if (peek_buf[0] == 0x04) {
-            uint16_t frame_len = (peek_buf[1] << 8) | peek_buf[2];
-            ESP_LOGW(TAG, "Pending Noise frame: type=0x%02x, len=%u", peek_buf[0], frame_len);
-
-            // Try to decrypt and see what HTTP/2 frame is inside
-            if (frame_len > 16 && peek_len >= 3 + frame_len) {
-                uint8_t decrypted[256];
-                esp_err_t dec_ret = noise_decrypt(ml->coordination.rx_key, ml->coordination.rx_nonce,
-                                                  NULL, 0, peek_buf + 3, frame_len, decrypted);
-                if (dec_ret == ESP_OK) {
-                    ml->coordination.rx_nonce++;
-                    size_t dec_len = frame_len - 16;
-                    if (dec_len >= 9) {
-                        uint32_t h2_len = (decrypted[0] << 16) | (decrypted[1] << 8) | decrypted[2];
-                        uint8_t h2_type = decrypted[3];
-                        ESP_LOGW(TAG, "Pending HTTP/2 frame: type=%u, len=%lu", h2_type, (unsigned long)h2_len);
-                        if (h2_type == 7) {
-                            ESP_LOGE(TAG, "*** Server sent GOAWAY - connection is being terminated! ***");
-                            ml->coordination.socket = -1;
-                            ml->coordination.goaway_received = true;
-                            return ESP_ERR_INVALID_STATE;
-                        }
-                    }
-                }
-            }
-        }
-    } else if (peek_len == 0) {
-        ESP_LOGE(TAG, "Server closed connection before MapRequest!");
-        ml->coordination.socket = -1;
-        return ESP_ERR_INVALID_STATE;
-    } else {
-        // peek_len < 0: EAGAIN or error - no pending data, which is normal
-        ESP_LOGI(TAG, "No pending server data before MapRequest (good)");
-    }
+    // Do not consume a partial Noise frame here. TCP is a byte stream:
+    // even MSG_PEEK can return fewer than three bytes. The reassembly loop
+    // below must be the sole consumer of incoming encrypted frame bytes.
 
     // Build MapRequest JSON
     cJSON *map_req = cJSON_CreateObject();
@@ -2646,7 +2646,8 @@ esp_err_t ts_coordination_fetch_peers(ts_t *ml) {
     }
 
     size_t json_len = strlen(map_req_str);
-    ESP_LOGI(TAG, "MapRequest (%u bytes): %.150s%s", (unsigned int)json_len, map_req_str, json_len > 150 ? "..." : "");
+    ESP_LOGI(TAG, "MapRequest prepared (%u bytes)",
+        (unsigned int)json_len);
 
     // Build HPACK headers for /machine/map
     uint8_t hpack_headers[256];
@@ -2761,11 +2762,7 @@ esp_err_t ts_coordination_fetch_peers(ts_t *ml) {
     int send_len = 3 + enc_len;
     ESP_LOGI(TAG, "Sending MapRequest: %d bytes (Noise frame: type=0x%02x, len=%d), sock=%d",
              send_len, enc_buf[0], enc_len, sock);
-    ESP_LOGI(TAG, "  First 16 bytes: %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x",
-             enc_buf[0], enc_buf[1], enc_buf[2], enc_buf[3],
-             enc_buf[4], enc_buf[5], enc_buf[6], enc_buf[7],
-             enc_buf[8], enc_buf[9], enc_buf[10], enc_buf[11],
-             enc_buf[12], enc_buf[13], enc_buf[14], enc_buf[15]);
+    ESP_LOGD(TAG, "Encrypted MapRequest ready (%d bytes)", send_len);
     int sent = send(sock, enc_buf, send_len, 0);
     free(enc_buf);
 
@@ -2875,7 +2872,17 @@ esp_err_t ts_coordination_fetch_peers(ts_t *ml) {
             }
 
             // Get frame length
-            int payload_len = (tcp_buffer[consumed + 1] << 8) | tcp_buffer[consumed + 2];
+            int payload_len = (tcp_buffer[consumed + 1] << 8) |
+                              tcp_buffer[consumed + 2];
+
+            // A Noise transport frame must contain a 16-byte MAC.
+            if (payload_len < NOISE_MAC_LEN) {
+                ESP_LOGE(TAG, "Invalid Noise frame: payload too short");
+                free(tcp_buffer);
+                free(h2_buffer);
+                return ESP_ERR_INVALID_SIZE;
+            }
+
             size_t frame_total = 3 + payload_len;
 
             // Check if we have the complete frame
@@ -2886,25 +2893,26 @@ esp_err_t ts_coordination_fetch_peers(ts_t *ml) {
             }
 
             // Decrypt this complete Noise frame
-            size_t decrypted_len = payload_len - 16;  // Minus MAC
-            uint8_t *decrypted = malloc(decrypted_len);
+            size_t decrypted_len = (size_t)payload_len - NOISE_MAC_LEN;
+            uint8_t *decrypted = malloc(decrypted_len > 0 ? decrypted_len : 1U);
             if (!decrypted) {
                 free(tcp_buffer);
                 free(h2_buffer);
                 return ESP_ERR_NO_MEM;
             }
 
-            ret = noise_decrypt(ml->coordination.rx_key, ml->coordination.rx_nonce++,
+            ret = noise_decrypt(ml->coordination.rx_key, ml->coordination.rx_nonce,
                                 NULL, 0, tcp_buffer + consumed + 3, payload_len, decrypted);
 
             if (ret != ESP_OK) {
-                ESP_LOGE(TAG, "Failed to decrypt Noise frame (nonce=%lu)",
-                         (unsigned long)(ml->coordination.rx_nonce - 1));
+                ESP_LOGE(TAG, "Failed to authenticate Noise frame (nonce=%lu)",
+                         (unsigned long)ml->coordination.rx_nonce);
                 free(decrypted);
                 free(tcp_buffer);
                 free(h2_buffer);
                 return ret;
             }
+            ml->coordination.rx_nonce++;
 
             // Check HTTP/2 frame header for DATA frames
             // In long-poll mode (Stream=true), END_STREAM won't come until connection closes
@@ -2926,10 +2934,15 @@ esp_err_t ts_coordination_fetch_peers(ts_t *ml) {
             }
 
             // Append to h2_buffer
-            if (h2_buffer_len + decrypted_len <= 32768) {
-                memcpy(h2_buffer + h2_buffer_len, decrypted, decrypted_len);
-                h2_buffer_len += decrypted_len;
+            if (decrypted_len > 32768U - h2_buffer_len) {
+                ESP_LOGE(TAG, "HTTP/2 receive buffer capacity exceeded");
+                free(decrypted);
+                free(tcp_buffer);
+                free(h2_buffer);
+                return ESP_ERR_INVALID_SIZE;
             }
+            memcpy(h2_buffer + h2_buffer_len, decrypted, decrypted_len);
+            h2_buffer_len += decrypted_len;
 
             free(decrypted);
             consumed += frame_total;
@@ -2966,6 +2979,17 @@ esp_err_t ts_coordination_fetch_peers(ts_t *ml) {
     size_t pos = 0;
     while (pos + 9 <= h2_buffer_len) {
         int frame_len = (h2_buffer[pos] << 16) | (h2_buffer[pos + 1] << 8) | h2_buffer[pos + 2];
+
+        // Validate that the complete HTTP/2 payload is available.
+        size_t available_payload = h2_buffer_len - pos - 9U;
+
+        if ((size_t)frame_len > available_payload) {
+            ESP_LOGE(TAG, "Truncated HTTP/2 frame");
+            free(json_buffer);
+            free(h2_buffer);
+            return ESP_ERR_INVALID_SIZE;
+        }
+
         int frame_type = h2_buffer[pos + 3];
         int frame_flags = h2_buffer[pos + 4];
         int stream_id = (h2_buffer[pos + 5] << 24) | (h2_buffer[pos + 6] << 16) |
@@ -2999,15 +3023,7 @@ esp_err_t ts_coordination_fetch_peers(ts_t *ml) {
                 hpack_byte == 0x8e ? "500 Internal Error" : "unknown";
             ESP_LOGI(TAG, "  HEADERS status: %s (HPACK byte 0x%02x)", status, hpack_byte);
 
-            // Log raw HPACK for debugging
-            if (frame_len > 1) {
-                ESP_LOGI(TAG, "  HPACK bytes: %02x %02x %02x %02x %02x...",
-                         h2_buffer[pos + 9],
-                         frame_len > 1 ? h2_buffer[pos + 10] : 0,
-                         frame_len > 2 ? h2_buffer[pos + 11] : 0,
-                         frame_len > 3 ? h2_buffer[pos + 12] : 0,
-                         frame_len > 4 ? h2_buffer[pos + 13] : 0);
-            }
+            // Keep only frame metadata; do not dump HPACK payload bytes.
         }
 
         // For RST_STREAM or GOAWAY, decode error code
@@ -3043,10 +3059,9 @@ esp_err_t ts_coordination_fetch_peers(ts_t *ml) {
         ESP_LOGW(TAG, "No DATA frames found in response");
         // Log the raw H2 buffer to see what we got (likely HEADERS with error status)
         if (h2_buffer_len > 0) {
-            ESP_LOGW(TAG, "H2 buffer (%u bytes): %02x %02x %02x %02x %02x %02x %02x %02x...",
-                     (unsigned int)h2_buffer_len,
-                     h2_buffer[0], h2_buffer[1], h2_buffer[2], h2_buffer[3],
-                     h2_buffer[4], h2_buffer[5], h2_buffer[6], h2_buffer[7]);
+            // Log metadata only, never raw response bytes.
+            ESP_LOGW(TAG, "H2 response contains %u bytes but no DATA frames",
+                     (unsigned int)h2_buffer_len);
             // Check if first frame is HEADERS (type 0x01)
             if (h2_buffer_len >= 9 && h2_buffer[3] == 0x01) {
                 int hdr_len = (h2_buffer[0] << 16) | (h2_buffer[1] << 8) | h2_buffer[2];
@@ -3075,19 +3090,17 @@ esp_err_t ts_coordination_fetch_peers(ts_t *ml) {
 
     free(h2_buffer);
 
-    // Log first bytes to identify compression/encoding
-    ESP_LOGI(TAG, "MapResponse first 32 bytes: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
-             json_buffer[0], json_buffer[1], json_buffer[2], json_buffer[3],
-             json_buffer[4], json_buffer[5], json_buffer[6], json_buffer[7],
-             json_buffer[8], json_buffer[9], json_buffer[10], json_buffer[11],
-             json_buffer[12], json_buffer[13], json_buffer[14], json_buffer[15]);
 
-    // Check for zstd magic (28 b5 2f fd)
-    bool is_zstd = (json_buffer[0] == 0x28 && json_buffer[1] == 0xb5 &&
-                    json_buffer[2] == 0x2f && json_buffer[3] == 0xfd);
+    // Validate response length before checking compression signatures.
+    bool is_zstd = (json_total_len >= 4 &&
+                    json_buffer[0] == 0x28 &&
+                    json_buffer[1] == 0xb5 &&
+                    json_buffer[2] == 0x2f &&
+                    json_buffer[3] == 0xfd);
 
-    // Check for gzip magic (1f 8b)
-    bool is_gzip = (json_buffer[0] == 0x1f && json_buffer[1] == 0x8b);
+    bool is_gzip = (json_total_len >= 2 &&
+                    json_buffer[0] == 0x1f &&
+                    json_buffer[1] == 0x8b);
 
     // Check for 4-byte length prefix followed by JSON FIRST (Tailscale binary framing)
     // Format: 4-byte length prefix + JSON payload
@@ -3143,16 +3156,15 @@ esp_err_t ts_coordination_fetch_peers(ts_t *ml) {
         json_str[json_str_len] = '\0';
     }
 
-    ESP_LOGI(TAG, "MapResponse JSON (%u bytes): %.200s%s", (unsigned int)json_str_len, json_str, json_str_len > 200 ? "..." : "");
+    ESP_LOGI(TAG, "MapResponse received (%u bytes)",
+         (unsigned int)json_str_len);
 
     cJSON *root = cJSON_Parse(json_str);
 
     if (!root) {
         ESP_LOGE(TAG, "Failed to parse MapResponse JSON (len=%u)", (unsigned int)json_str_len);
         // Log the first 64 bytes to help debug the format
-        if (json_str && json_str_len > 0) {
-            ESP_LOGE(TAG, "JSON start: %.64s", json_str);
-        }
+        ESP_LOGE(TAG, "MapResponse payload redacted from logs");
         // Check cJSON error position
         const char *error_ptr = cJSON_GetErrorPtr();
         if (error_ptr != NULL) {
@@ -3164,27 +3176,6 @@ esp_err_t ts_coordination_fetch_peers(ts_t *ml) {
 
     free(json_buffer);  // json_str points to json_buffer, safe to free after cJSON_Parse copies it
 
-    // Debug: List all top-level fields in the MapResponse
-    ESP_LOGI(TAG, "MapResponse top-level fields:");
-    cJSON *field = NULL;
-    cJSON_ArrayForEach(field, root) {
-        if (field->string) {
-            if (cJSON_IsArray(field)) {
-                ESP_LOGI(TAG, "  - %s (array, size=%d)", field->string, cJSON_GetArraySize(field));
-            } else if (cJSON_IsObject(field)) {
-                ESP_LOGI(TAG, "  - %s (object)", field->string);
-            } else if (cJSON_IsString(field)) {
-                ESP_LOGI(TAG, "  - %s (string): %.40s...", field->string, field->valuestring);
-            } else if (cJSON_IsNumber(field)) {
-                ESP_LOGI(TAG, "  - %s (number): %g", field->string, field->valuedouble);
-            } else if (cJSON_IsBool(field)) {
-                ESP_LOGI(TAG, "  - %s (bool): %s", field->string, cJSON_IsTrue(field) ? "true" : "false");
-            } else {
-                ESP_LOGI(TAG, "  - %s (other)", field->string);
-            }
-        }
-    }
-
     // Extract Node.Addresses for VPN IP
     cJSON *node = cJSON_GetObjectItem(root, "Node");
     if (node) {
@@ -3193,7 +3184,8 @@ esp_err_t ts_coordination_fetch_peers(ts_t *ml) {
             cJSON *addr = cJSON_GetArrayItem(addresses, 0);
             if (addr && cJSON_IsString(addr)) {
                 unsigned int a, b, c, d;
-                if (sscanf(addr->valuestring, "%u.%u.%u.%u", &a, &b, &c, &d) == 4) {
+                if (sscanf(addr->valuestring, "%u.%u.%u.%u", &a, &b, &c, &d) == 4 &&
+                    a <= 255 && b <= 255 && c <= 255 && d <= 255) {
                     ml->vpn_ip = (a << 24) | (b << 16) | (c << 8) | d;
                     ESP_LOGI(TAG, "*** VPN IP assigned: %s ***", addr->valuestring);
 
@@ -3312,6 +3304,7 @@ esp_err_t ts_coordination_fetch_peers(ts_t *ml) {
         ml->peer_count = 0;
         memset(ml->peers, 0, sizeof(ml->peers));
         memset(ml->peer_map, 0xFF, sizeof(ml->peer_map));  // 0xFF = invalid index
+        memset(ml->peer_wg_indices, 0xFF, sizeof(ml->peer_wg_indices));
 
         // Parse each peer (up to TS_MAX_PEERS)
         int added_peers = 0;
@@ -3385,7 +3378,8 @@ esp_err_t ts_coordination_fetch_peers(ts_t *ml) {
                 cJSON *addr = cJSON_GetArrayItem(addresses, 0);
                 if (addr && cJSON_IsString(addr)) {
                     unsigned int a, b, c, d;
-                    if (sscanf(addr->valuestring, "%u.%u.%u.%u", &a, &b, &c, &d) == 4) {
+                    if (sscanf(addr->valuestring, "%u.%u.%u.%u", &a, &b, &c, &d) == 4 &&
+                    a <= 255 && b <= 255 && c <= 255 && d <= 255) {
                         peer->vpn_ip = (a << 24) | (b << 16) | (c << 8) | d;
                     }
                 }
@@ -3400,7 +3394,8 @@ esp_err_t ts_coordination_fetch_peers(ts_t *ml) {
                     if (ep_idx >= TS_MAX_ENDPOINTS) break;
                     if (cJSON_IsString(ep)) {
                         unsigned int ea, eb, ec, ed, eport;
-                        if (sscanf(ep->valuestring, "%u.%u.%u.%u:%u", &ea, &eb, &ec, &ed, &eport) == 5) {
+                        if (sscanf(ep->valuestring, "%u.%u.%u.%u:%u", &ea, &eb, &ec, &ed, &eport) == 5 &&
+                            ea <= 255 && eb <= 255 && ec <= 255 && ed <= 255 && eport <= 65535) {
                             peer->endpoints[ep_idx].addr.ip4 = htonl((ea << 24) | (eb << 16) | (ec << 8) | ed);
                             peer->endpoints[ep_idx].port = (uint16_t)eport;
                             peer->endpoints[ep_idx].is_ipv6 = 0;
@@ -3513,7 +3508,9 @@ esp_err_t ts_coordination_fetch_peers(ts_t *ml) {
 
     if (longpoll_str) {
         size_t longpoll_json_len = strlen(longpoll_str);
-        ESP_LOGI(TAG, "Long-poll MapRequest (%u bytes): %s", (unsigned int)longpoll_json_len, longpoll_str);
+
+            ESP_LOGI(TAG, "Long-poll MapRequest prepared (%u bytes)",
+                 (unsigned int)longpoll_json_len);
 
         // Build HTTP/2 frame for long-poll request
         uint8_t longpoll_hpack[128];
@@ -3791,7 +3788,7 @@ esp_err_t ts_coordination_heartbeat(ts_t *ml) {
     }
 
     size_t json_len = strlen(map_req_str);
-    ESP_LOGI(TAG, "Heartbeat MapRequest: %s", map_req_str);
+    ESP_LOGI(TAG, "Heartbeat MapRequest prepared (%u bytes)", (unsigned int)json_len);
 
     // Build HPACK headers for /machine/map
     uint8_t hpack_headers[256];
@@ -4113,13 +4110,9 @@ esp_err_t ts_coordination_poll_updates(ts_t *ml) {
         size_t consumed = 0;
         int unexpected_count = 0;  // Limit logging per call
 
-        // Debug: Log buffer info if we got data and first byte isn't 0x04
         if (tcp_buffer_len > 0 && tcp_buffer[0] != 0x04) {
-            ESP_LOGW(TAG, "poll_updates: buffer not aligned! len=%u, rx_nonce=%lu, first 16 bytes:",
-                     (unsigned int)tcp_buffer_len, (unsigned long)ml->coordination.rx_nonce);
-            for (size_t i = 0; i < 16 && i < tcp_buffer_len; i++) {
-                ESP_LOGW(TAG, "  [%u] = 0x%02x", (unsigned int)i, tcp_buffer[i]);
-            }
+            ESP_LOGW(TAG, "Long-poll receive buffer not aligned (%u bytes)",
+                     (unsigned int)tcp_buffer_len);
         }
 
         while (consumed + 3 <= tcp_buffer_len && ret == ESP_OK) {
@@ -4150,14 +4143,14 @@ esp_err_t ts_coordination_poll_updates(ts_t *ml) {
         }
 
         // Decrypt this Noise frame
-        size_t decrypted_len = payload_len - 16;  // Minus 16-byte Poly1305 MAC
-        if (payload_len < 16) {
-            ESP_LOGW(TAG, "Noise frame too short: %d bytes", payload_len);
-            consumed += frame_total;
-            continue;
+        if (payload_len < NOISE_MAC_LEN) {
+            ESP_LOGE(TAG, "Invalid Noise transport frame; reconnect required");
+            ret = ESP_ERR_INVALID_SIZE;
+            break;
         }
+        size_t decrypted_len = (size_t)payload_len - NOISE_MAC_LEN;
 
-        uint8_t *decrypted = malloc(decrypted_len);
+        uint8_t *decrypted = malloc(decrypted_len > 0 ? decrypted_len : 1U);
         if (!decrypted) {
             ret = ESP_ERR_NO_MEM;
             break;
@@ -4270,25 +4263,6 @@ esp_err_t ts_coordination_poll_updates(ts_t *ml) {
 
             ESP_LOGI(TAG, "Long-poll H2 frame: %s len=%d flags=0x%02x",
                      type_name, h2_len, h2_flags);
-
-            // Log DATA frame content for debugging
-            if (h2_type == 0x00 && h2_len > 0 && decrypted_len > 9) {
-                // DATA payload starts at offset 9 in the decrypted buffer
-                int log_len = (h2_len < 200) ? h2_len : 200;
-                char log_buf[512];
-                int log_pos = 0;
-                for (int i = 0; i < log_len && i < (int)decrypted_len - 9; i++) {
-                    char c = decrypted[9 + i];
-                    if (c >= 32 && c < 127) {
-                        log_buf[log_pos++] = c;
-                    } else {
-                        log_pos += snprintf(log_buf + log_pos, sizeof(log_buf) - log_pos, "\\x%02x", (uint8_t)c);
-                    }
-                    if (log_pos >= 450) break;
-                }
-                log_buf[log_pos] = '\0';
-                ESP_LOGI(TAG, "Long-poll DATA content: %s", log_buf);
-            }
 
             // Handle HTTP/2 DATA frames - send WINDOW_UPDATE to acknowledge
             // This is CRITICAL for HTTP/2 flow control! Without WINDOW_UPDATE,
@@ -4686,22 +4660,25 @@ static void coordination_poll_task(void *pvParameters) {
 
         uint8_t *buffer = ml->coordination.psram_buffer;
         uint8_t *recv_buffer = buffer + RECV_BUFFER_OFFSET;
+        if (buffer_len >= RECV_BUFFER_SIZE) {
+            ESP_LOGE(TAG, "[Core1] TCP receive buffer at capacity (%u bytes)",
+                     (unsigned int)buffer_len);
+            ml->coordination.connection_error = true;
+            fcntl(sock, F_SETFL, flags);
+            xSemaphoreGive(ml->coordination.mutex);
+            break;
+        }
         size_t space_available = RECV_BUFFER_SIZE - buffer_len;
 
         // Read new data into buffer after existing unconsumed data
         int recv_len = recv(sock, recv_buffer + buffer_len, space_available, 0);
 
         if (recv_len > 0) {
-            size_t old_buffer_len = buffer_len;
-            buffer_len += recv_len;
+            buffer_len += (size_t)recv_len;
 
-            // Log what we received for debugging
-            ESP_LOGI(TAG, "[Core1] Recv %d bytes (buffer now %u), first 16: %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x",
-                     recv_len, (unsigned int)buffer_len,
-                     recv_buffer[old_buffer_len+0], recv_buffer[old_buffer_len+1], recv_buffer[old_buffer_len+2], recv_buffer[old_buffer_len+3],
-                     recv_buffer[old_buffer_len+4], recv_buffer[old_buffer_len+5], recv_buffer[old_buffer_len+6], recv_buffer[old_buffer_len+7],
-                     recv_buffer[old_buffer_len+8], recv_buffer[old_buffer_len+9], recv_buffer[old_buffer_len+10], recv_buffer[old_buffer_len+11],
-                     recv_buffer[old_buffer_len+12], recv_buffer[old_buffer_len+13], recv_buffer[old_buffer_len+14], recv_buffer[old_buffer_len+15]);
+            // Log received length only, never raw network bytes.
+            ESP_LOGD(TAG, "[Core1] Recv %d bytes (buffer now %u)",
+                    recv_len, (unsigned int)buffer_len);
 
             // Process received Noise frames from the ENTIRE buffer (including leftover data)
             size_t consumed = 0;
@@ -4709,9 +4686,9 @@ static void coordination_poll_task(void *pvParameters) {
 
             while (consumed + 3 <= buffer_len) {
                 if (data[consumed] != 0x04) {
-                    ESP_LOGW(TAG, "[Core1] Non-0x04 byte at offset %u: 0x%02x", (unsigned int)consumed, data[consumed]);
-                    consumed++;
-                    continue;
+                    ESP_LOGE(TAG, "[Core1] Invalid Noise transport frame; reconnect required");
+                    ml->coordination.connection_error = true;
+                    break;
                 }
 
                 int payload_len = (data[consumed + 1] << 8) | data[consumed + 2];
@@ -4721,15 +4698,23 @@ static void coordination_poll_task(void *pvParameters) {
                     break;  // Incomplete frame - will get rest on next recv
                 }
 
-                if (payload_len < 16) {
-                    ESP_LOGW(TAG, "[Core1] Frame too short: payload_len=%d (need >= 16 for MAC)", payload_len);
-                    consumed += 3 + payload_len;
-                    continue;
+                if (payload_len < NOISE_MAC_LEN) {
+                    ESP_LOGE(TAG, "[Core1] Noise transport frame shorter than authentication tag");
+                    ml->coordination.connection_error = true;
+                    break;
                 }
 
                 {
-                    size_t decrypted_len = payload_len - 16;
-                    uint8_t *decrypted = buffer + 128;  // Use offset 128-1024 for decryption output (before recv buffer at 1024)
+                    size_t decrypted_len = (size_t)payload_len - NOISE_MAC_LEN;
+
+                    // Allocate a separate buffer to prevent overlap with received data.
+                    uint8_t *decrypted = malloc(decrypted_len > 0 ? decrypted_len : 1U);
+
+                    if (decrypted == NULL) {
+                        ESP_LOGE(TAG, "[Core1] Failed to allocate decrypted buffer");
+                        ml->coordination.connection_error = true;
+                        break;
+                    }
 
                     // Try to decrypt with current nonce
                     uint64_t try_nonce = ml->coordination.rx_nonce;
@@ -4791,17 +4776,17 @@ static void coordination_poll_task(void *pvParameters) {
                         ESP_LOGW(TAG, "[Core1] Decrypt failed (count=%d) nonce=%lu, frame_len=%d, consumed=%u/%d",
                                  decrypt_fail_count, (unsigned long)try_nonce, payload_len,
                                  (unsigned int)consumed, recv_len);
-                        ESP_LOGW(TAG, "[Core1] Frame bytes: %02x%02x%02x | %02x%02x%02x%02x %02x%02x%02x%02x",
-                                 data[consumed], data[consumed+1], data[consumed+2],
-                                 data[consumed+3], data[consumed+4], data[consumed+5], data[consumed+6],
-                                 data[consumed+7], data[consumed+8], data[consumed+9], data[consumed+10]);
 
                         // On first decrypt failure, signal error - no point continuing
                         // Noise nonce desync is unrecoverable without reconnection
                         ESP_LOGE(TAG, "[Core1] Nonce desync detected, will reconnect");
                         ml->coordination.connection_error = true;
+                        free(decrypted);
                         break;  // Exit frame processing loop
                     }
+
+                    // Release the buffer after successful decryption.
+                    free(decrypted);
                 }
 
                 consumed += 3 + payload_len;
@@ -4825,6 +4810,11 @@ static void coordination_poll_task(void *pvParameters) {
 
             ml->coordination.frames_processed = local_frames_processed;
 
+            if (ml->coordination.connection_error) {
+                fcntl(sock, F_SETFL, flags);
+                xSemaphoreGive(ml->coordination.mutex);
+                break;
+            }
         } else if (recv_len == 0) {
             // Connection closed
             ESP_LOGW(TAG, "[Core1] Connection closed by server");

@@ -334,18 +334,14 @@ void ts_state_machine(ts_t *ml) {
                 }
             }
 
-            // Process incoming DERP packets if enabled
-            if (ml->config.enable_derp) {
-                if (ml->derp.connected) {
-                    ts_derp_receive(ml);
-                } else {
-                    // DERP dropped - try to reconnect periodically
-                    static uint64_t last_derp_retry = 0;
-                    if (now_ms - last_derp_retry >= 10000) {  // Retry every 10s
-                        ESP_LOGW(TAG, "DERP disconnected, attempting reconnect...");
-                        ts_derp_connect(ml);
-                        last_derp_retry = now_ms;
-                    }
+            // DERP receive is owned by ts_update(); do not re-enter it here.
+            if (ml->config.enable_derp && !ml->derp.connected) {
+                // DERP dropped - try to reconnect periodically
+                static uint64_t last_derp_retry = 0;
+                if (now_ms - last_derp_retry >= 10000) {  // Retry every 10s
+                    ESP_LOGW(TAG, "DERP disconnected, attempting reconnect...");
+                    ts_derp_reconnect(ml);
+                    last_derp_retry = now_ms;
                 }
             }
 

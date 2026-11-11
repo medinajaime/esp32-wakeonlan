@@ -1,7 +1,7 @@
 # ESP32 Wake-on-LAN via Tailscale
 
-Wake up a PC on your home network from anywhere through Tailscale, using an
-ESP32 as a small always-on Wake-on-LAN bridge.
+Wake up a PC on your home network from anywhere through Tailscale, using the
+**ESP32-WROOM-32D dev kit** as a small always-on Wake-on-LAN bridge.
 
 ```text
 [You, anywhere] --Tailscale--> [ESP32 on LAN] --UDP broadcast--> [Sleeping PC]
@@ -9,6 +9,17 @@ ESP32 as a small always-on Wake-on-LAN bridge.
 
 The ESP32 joins your tailnet, listens for a UDP trigger, and broadcasts a WoL
 magic packet on your local network.
+
+## Related Proxmox Homelab
+
+This ESP32 firmware is one component of the broader [Proxmox Cloud Homelab](https://github.com/vmanX8/proxmox-cloud-homelab).
+
+- [Lab 06 — ESP32 Remote Wake-on-LAN Gateway](https://github.com/vmanX8/proxmox-cloud-homelab/blob/main/docs/06-esp32-remote-wol-gateway.md) documents how the gateway fits into the Proxmox host and Tailscale/WoL architecture.
+- [Architecture overview](https://github.com/vmanX8/proxmox-cloud-homelab/blob/main/docs/ARCHITECTURE.md) separates powered-on remote management from remote wake-up.
+
+**Validation boundary:** The two successful end-to-end tests demonstrate functional wake-up on the tested hardware and observed DERP relay path. They do **not** resolve the disabled DERP TLS server verification, wake-command authorization audit or long-term reliability testing. See [validation and limitations](docs/VALIDATION_AND_LIMITATIONS.md).
+
+The firmware, dependencies, setup scripts, third-party notices and implementation history remain in this repository; the Proxmox repository only links here and does not duplicate the source code.
 
 ## How It Works
 
@@ -18,23 +29,94 @@ magic packet on your local network.
 4. The ESP32 broadcasts a WoL magic packet on the LAN.
 5. The target PC's Ethernet NIC receives the packet and powers on.
 
+## Tested adaptation — 10 November 2026
+
+This repository adapts the original project for an **ESP32-WROOM-32D dev kit**
+(4 MB flash, no PSRAM) and an Ethernet-connected Proxmox host. The firmware
+was built with **ESP-IDF v5.5.3**, and an Android Tailscale peer successfully
+woke the target from complete shutdown **twice**, including a shutdown between
+the tests. The observed Tailscale path was **DERP-relayed**; direct UDP was not
+validated.
+
+Relative to upstream, the local changes cover safer Noise/HTTP2 parsing and
+key persistence, WireGuard initialization, DERP queue/reconnect handling, and
+lwIP timer lifecycle. They were developed and reviewed with AI assistance,
+then built and tested on the actual device. This is a tested adaptation, **not
+an independently implemented Tailscale/WireGuard stack**.
+
+- [Final implementation differences from upstream](docs/CHANGES_FROM_UPSTREAM.md)
+- [Hardware validation, limitations and security status](docs/VALIDATION_AND_LIMITATIONS.md)
+- [Upstream developers, third-party credits and licensing](docs/UPSTREAM_ATTRIBUTION.md)
+
+**Security status:** Functionally validated for this wake scenario and
+substantially hardened relative to the reviewed upstream baseline. The
+implementation includes additional parser validation, key-persistence safeguards,
+DERP queue/reconnect improvements, reduced sensitive logging and WireGuard/lwIP
+lifecycle fixes. However, authenticated DERP TLS certificate verification
+remains an open blocker, and the UDP wake-command authorization model still
+requires a dedicated security audit.
+
+### Security improvements relative to upstream
+
+- Added validation for untrusted Noise frame lengths before parsing or
+  decryption.
+- Added HTTP/2 frame bounds checking to reduce out-of-bounds read risks.
+- Corrected Noise nonce advancement so receive nonces are updated only after
+  successful authentication.
+- Removed logging of WireGuard keys, Noise keys, nonces, challenge responses,
+  encrypted payloads and other sensitive protocol material.
+- Hardened persistent identity handling by failing closed on NVS storage errors
+  instead of silently generating replacement identities.
+- Added validation and bounds checks around peer, endpoint and protocol data
+  received from coordination servers.
+- Improved DERP framing and reconnect behavior after partial-frame failures.
+- Reworked DERP packet queuing with bounded memory usage, retry limits, aging
+  and duplicate suppression.
+- Moved WireGuard lifecycle operations to lwIP's TCP/IP thread to better align
+  with lwIP ownership requirements.
+- Added explicit WireGuard timer shutdown handling to reduce use-after-free risk
+  during interface teardown.
+
+### Areas still requiring review
+
+The implementation is not considered production-secure.
+
+Known security gaps include:
+
+1. **DERP TLS certificate verification remains disabled.**
+   Reviewed code paths still use `MBEDTLS_SSL_VERIFY_NONE`, meaning DERP server
+   identity is not cryptographically verified.
+
+2. **Wake-command authorization has not been independently audited.**
+   The WoL trigger mechanism should be protected with restrictive Tailscale ACLs
+   and should never be exposed through public Internet port-forwarding.
+
+3. **Long-term resilience remains unverified.**
+   Stress testing, endurance testing, reconnect cycling and memory-fragmentation
+   behavior have not been fully characterized.
+
 ## Hardware
 
-Any standard ESP32 dev board should work. The project is tuned for a classic
-ESP32 without PSRAM, such as a NodeMCU-32S / ESP32S.
+The validated controller is an **ESP32-WROOM-32D dev kit** with 4 MB flash
+and no PSRAM. Other hardware configurations were not tested in this work.
 
 WoL requires the target PC to be connected by Ethernet. Most WiFi NICs do not
 support Wake-on-LAN magic packets.
 
 ## Quick Start: Windows PowerShell
 
+**Important:** For the changes documented here, use this modified repository,
+not a fresh copy of upstream. The setup scripts can regenerate/remove local
+`sdkconfig`; back it up first and do not rerun provisioning blindly on a
+previously enrolled device. Never commit `sdkconfig`, device keys or flash dumps.
+
 Windows users should use the native PowerShell setup script. It checks for
 ESP-IDF, installs Espressif EIM CLI with `winget` when possible, installs the
 preferred ESP-IDF version, prompts for project settings, builds, and flashes.
 
+From the **root of this modified clone** (not a fresh upstream checkout):
+
 ```powershell
-git clone https://github.com/medinajaime/esp32-wakeonlan.git
-cd esp32-wakeonlan
 .\scripts\setup.ps1
 ```
 
@@ -58,9 +140,9 @@ https://docs.espressif.com/projects/esp-idf/en/stable/esp32/get-started/windows-
 
 Linux users should use the Bash setup script:
 
+From the root of the modified clone:
+
 ```bash
-git clone https://github.com/medinajaime/esp32-wakeonlan.git
-cd esp32-wakeonlan
 bash scripts/setup.sh
 ```
 
@@ -124,16 +206,21 @@ Windows:
 idf.py monitor -p COM3
 ```
 
-Then send a UDP trigger from any Tailscale peer:
+After configuring restrictive tailnet access, send a UDP trigger from an
+authorized Tailscale peer. The wake payload is **not** an authentication
+secret; do not open the UDP listener to the public Internet:
+
+Set `ESP32_IP` to the device address from the Tailscale administration view,
+then send the trigger (never substitute an external/public IP):
 
 ```bash
-echo wake | nc -u <esp32-tailscale-ip> 9999 -w1
+echo wake | nc -u "$ESP32_IP" 9999 -w1
 ```
 
 The Linux setup script also installs `scripts/wake-pc` to `~/.local/bin`:
 
 ```bash
-wake-pc --save <esp32-tailscale-ip>
+wake-pc --save "$ESP32_IP"
 wake-pc
 ```
 
@@ -159,8 +246,8 @@ sudo ethtool -s eth0 wol g
 
 ## 3D Printed Enclosure
 
-This repo includes a parametric CadQuery enclosure for the NodeMCU-32S /
-ESP32S-style board:
+This repo retains an upstream parametric CadQuery enclosure example.
+Its dimensions have **not** been verified for the ESP32-WROOM-32D dev kit:
 
 ```bash
 pip install cadquery
@@ -253,6 +340,12 @@ temporary guided configuration is applied cleanly.
 - Any allowed Tailscale peer can trigger wake unless restricted by Tailscale ACLs.
 - The no-PSRAM ESP32 heap is tight; reduce `CONFIG_TS_COORD_BUFFER_SIZE_KB` if needed.
 
-## License
+## Attribution and licensing
 
-MIT
+This is an adaptation of [medinajaime/esp32-wakeonlan](https://github.com/medinajaime/esp32-wakeonlan),
+not an independent implementation of the original Tailscale/Wake-on-LAN code.
+The upstream README states **MIT**; confirm the applicable repository license
+and retain required notices before redistribution. The bundled
+[wireguard-lwip](https://github.com/smartalock/wireguard-lwip) component contains
+separate **BSD 3-Clause** copyright notices attributed to Daniel Hope;
+these must be preserved. See [full attribution](docs/UPSTREAM_ATTRIBUTION.md).

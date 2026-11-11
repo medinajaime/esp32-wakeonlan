@@ -329,7 +329,7 @@
 
     <h3>Hardware</h3>
     <ul>
-      <li><strong>Any ESP32 board</strong> — NodeMCU-32S, HiLetgo ESP-32S, Espressif DevKitC, or equivalent. No PSRAM required.</li>
+      <li><strong>Validated board:</strong> ESP32-WROOM-32D dev kit (no PSRAM). Other ESP32 boards mentioned by upstream have not been validated for this fork.</li>
       <li><strong>USB cable</strong> — for the initial flash only. After that, just 5 V power.</li>
       <li><strong>Target PC</strong> — must have an Ethernet NIC with Wake-on-LAN enabled in BIOS and OS. WiFi NICs generally do not support WoL.</li>
     </ul>
@@ -500,7 +500,7 @@ WakeOnLan=magic</code></pre>
     </ol>
 
     <div class="callout warning">
-      <strong>Note:</strong> The setup script never writes your credentials to any file that could be committed to git. The temporary config is cleaned up immediately after flashing.
+      <strong>Security note:</strong> Setup writes Wi-Fi and Tailscale credentials to a temporary configuration file, and the ESP-IDF build generates <code>sdkconfig</code>. Treat these as sensitive; <code>sdkconfig</code> is ignored by Git, but always review tracked files before publishing.
     </div>
 
     <h2 id="manual-build">Manual Build</h2>
@@ -703,7 +703,7 @@ Bytes 6–101 : &lt;target MAC&gt; × 16          (MAC repeated 16 times)</code>
       <li>When coordination comes back up, the socket is refreshed (new WireGuard handshakes + CallMeMaybe to all peers)</li>
     </ul>
 
-    <p>The <code>wake-pc</code> script's 25-second retry window is designed to cover one full reconnect cycle, guaranteeing delivery.</p>
+    <p>The <code>wake-pc</code> script retries for up to 25 seconds to improve the chance of delivery during a reconnect. UDP delivery is not guaranteed.</p>
 
     <!-- ── Troubleshooting ────────────────────────────── -->
 

@@ -262,6 +262,9 @@ ts_state_t ts_get_state(const ts_t *ml);
  */
 bool ts_is_connected(const ts_t *ml);
 
+/** @brief Return whether the DERP relay session is currently connected. */
+bool ts_is_derp_connected(const ts_t *ml);
+
 /**
  * @brief Get our VPN IP address
  *
